@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>知见</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">知<span>见</span></div>
+  <div class="tabs">
+    <button class="tab active" data-platform="">全部</button>
+    <button class="tab" data-platform="weibo">微博</button>
+    <button class="tab" data-platform="taoguba">淘股吧</button>
+    <button class="tab" data-platform="zsxq">知识星球</button>
+    <button class="tab" data-platform="weread">公众号</button>
+  </div>
+  <input class="search-box" id="searchBox" placeholder="搜索内容 / 标题 / 作者…">
+  <button class="icon-btn" onclick="openSettings()">⚙ 设置</button>
+</div>
+
+<div class="status-bar" id="statusBar"></div>
+<div class="author-chip" id="authorChip" style="display:none" title="点击取消筛选"><span></span><b>✕</b></div>
+<div class="banner" id="banner"></div>
+
+<div class="feed" id="feed">
+  <div class="new-tip" id="newTip" style="display:none"><span></span></div>
+  <div class="empty" id="empty" style="display:none">
+    还没有帖子。<br>点右上角「⚙ 设置」添加监控用户，下一轮轮询后这里就会出现内容。
+  </div>
+</div>
+<button class="load-more" id="loadMore" style="display:none" onclick="loadMore()">加载更早的帖子</button>
+
+<div class="drawer-mask" id="drawerMask" onclick="closeSettings()"></div>
+<div class="drawer" id="drawer">
+  <h2>⚙ 设置</h2>
+
+  <h3>监控用户</h3>
+  <div id="userList"></div>
+  <div style="display:flex;gap:8px;margin-bottom:10px">
+    <button class="btn ghost" style="flex:1" onclick="exportUsers()">⤓ 导出列表</button>
+    <button class="btn ghost" style="flex:1" onclick="document.getElementById('importFile').click()">⤒ 导入列表</button>
+    <input type="file" id="importFile" accept=".json" style="display:none" onchange="importUsers(this)">
+  </div>
+  <div class="add-row">
+    <select id="newPlatform">
+      <option value="weibo">微博</option>
+      <option value="taoguba">淘股吧</option>
+      <option value="zsxq">知识星球</option>
+      <option value="weread">公众号</option>
+    </select>
+    <input id="newUid" placeholder="用户 ID（微博数字 uid / 淘股吧 blog 数字）">
+    <button class="btn ghost" onclick="addUser()">＋</button>
+  </div>
+  <div class="hint">
+    微博 ID：打开 m.weibo.cn/u/xxxxx，xxxx 即 uid。<br>
+    淘股吧 ID：打开用户主页 tgb.cn/blog/xxxxx，xxxx 即 ID。<br>
+    知识星球：填「星球ID」监控整个星球；填「星球ID:用户ID」监控星球里某个人。
+    星球 ID 在星球主页网址里（wx.zsxq.com/dweb2/index/group/数字）。<br>
+    公众号：手机微信读书 App 订阅该公众号后，点下方「同步书架」勾选添加（推荐）；也可直接填 MP_WXS_ 开头的 ID。
+  </div>
+
+  <h3>平台凭证</h3>
+  <div class="field">
+    <label>微博 Cookie（必须，含 SUB= 字段；●●● 表示已保存未修改）</label>
+    <input id="weiboCookie" placeholder="粘贴整条 Cookie">
+  </div>
+  <div class="field">
+    <label>淘股吧 Cookie（可选，公开内容不登录也能抓）</label>
+    <input id="taogubaCookie" placeholder="可留空">
+  </div>
+  <div class="field">
+    <label>知识星球 Token（zsxq_access_token，网页版 F12 获取）</label>
+    <input id="zsxqToken" placeholder="粘贴 zsxq_access_token 的值">
+  </div>
+  <div class="field">
+    <label>微信读书 Cookie·公众号（weread.qq.com 网页版 F12 获取；程序会自动续期）</label>
+    <input id="wereadCookie" placeholder="wr_vid=…; wr_skey=…; wr_rt=…; wr_fp=…">
+  </div>
+  <div class="field">
+    <label>书架上的公众号（先在手机 App 里订阅，再点同步）</label>
+    <button class="btn ghost" onclick="syncShelf()">🔄 同步书架</button>
+    <div id="shelfList" style="margin-top:8px"></div>
+  </div>
+
+  <h3>外观</h3>
+  <div class="field">
+    <label>主题（选择后立即生效并记住）</label>
+    <select id="themeSelect">
+      <option value="dark">深色</option>
+      <option value="light">浅色</option>
+    </select>
+  </div>
+
+  <h3>轮询与访问</h3>
+  <div class="field">
+    <label>轮询间隔（秒，建议 60~300）</label>
+    <input id="interval" type="number" min="30">
+  </div>
+  <div class="field">
+    <label>访问密码（留空 = 不需要密码；部署到公网务必设置）</label>
+    <input id="accessPassword" placeholder="留空则不启用">
+  </div>
+
+  <div class="btn-row">
+    <button class="btn" onclick="saveSettings()">保存</button>
+    <button class="btn ghost" onclick="closeSettings()">取消</button>
+  </div>
+  <div class="hint">凭证只保存在本程序所在目录的 data/config.json，不会上传任何地方。</div>
+</div>
+
+<div class="lightbox" id="lightbox"><img src=""></div>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

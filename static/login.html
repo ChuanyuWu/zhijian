@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 - 知见</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  .login-box {
+    max-width: 340px; margin: 18vh auto; background: var(--bg-card);
+    border: 1px solid var(--border); border-radius: 14px; padding: 34px 30px;
+  }
+  .login-box h1 { font-size: 20px; margin-bottom: 22px; text-align: center; }
+  .login-box input {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 14px; color: var(--text);
+    font-size: 14px; outline: none; margin-bottom: 14px;
+  }
+  .login-box input:focus { border-color: var(--accent); }
+  .login-box button { width: 100%; padding: 11px; font-size: 14px; }
+  .err { color: var(--danger); font-size: 12px; text-align: center; display: none; }
+</style>
+</head>
+<body>
+<div class="login-box">
+  <h1>知<span style="color:var(--accent)">见</span></h1>
+  <input id="pw" type="password" placeholder="访问密码" autofocus>
+  <button class="btn" onclick="login()">进入</button>
+  <p class="err" id="err">密码错误</p>
+</div>
+<script>
+async function login() {
+  const r = await fetch("/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password: document.getElementById("pw").value }),
+  });
+  if (r.ok) location.href = "/";
+  else document.getElementById("err").style.display = "block";
+}
+document.getElementById("pw").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+data/
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+run_hidden.vbs
+*.exe
+*.zip
