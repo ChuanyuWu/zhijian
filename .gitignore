@@ -7,3 +7,11 @@ build/
 run_hidden.vbs
 *.exe
 *.zip
+browsers/
+*.spec
+zhijian-tests-*/
+test-results/
+.pytest_cache/
+release/
+*.log
+_internal/

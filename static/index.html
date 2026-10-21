@@ -38,7 +38,10 @@
 <div class="drawer" id="drawer">
   <h2>⚙ 设置</h2>
 
-  <h3>监控用户</h3>
+  <h3>① 连接平台账号</h3>
+  <div class="hint">点击连接，在官方窗口登录。二维码显示在电脑上，用手机对应 App 扫码确认。登录过期后需重新连接。</div>
+  <div id="connections"></div>
+  <h3>② 添加监控对象</h3>
   <div id="userList"></div>
   <div style="display:flex;gap:8px;margin-bottom:10px">
     <button class="btn ghost" style="flex:1" onclick="exportUsers()">⤓ 导出列表</button>
@@ -63,31 +66,22 @@
     公众号：手机微信读书 App 订阅该公众号后，点下方「同步书架」勾选添加（推荐）；也可直接填 MP_WXS_ 开头的 ID。
   </div>
 
-  <h3>平台凭证</h3>
+  <details class="manual-credentials">
+    <summary>手动凭据备用入口</summary>
+    <p class="hint">通常无需填写。无法打开登录窗口时可手动粘贴，点击下方保存后再验证连接。输入为空且未编辑表示保持原样；编辑后清空将删除凭据。</p>
+    <div class="field"><label>微博 Cookie（含 SUB）</label><input id="weiboCookie" type="password" autocomplete="off"></div>
+    <div class="field"><label>淘股吧 Cookie（可选）</label><input id="taogubaCookie" type="password" autocomplete="off"></div>
+    <div class="field"><label>知识星球 zsxq_access_token（不是 Authorization）</label><input id="zsxqToken" type="password" autocomplete="off"></div>
+    <div class="field"><label>微信读书 Cookie（含 wr_vid / wr_skey）</label><input id="wereadCookie" type="password" autocomplete="off"></div>
+  </details>
   <div class="field">
-    <label>微博 Cookie（必须，含 SUB= 字段；●●● 表示已保存未修改）</label>
-    <input id="weiboCookie" placeholder="粘贴整条 Cookie">
+    <label>书架上的公众号（先在手机微信读书 App 订阅）</label>
+    <button class="btn ghost" onclick="syncShelf()">同步书架</button><div id="shelfList"></div>
   </div>
-  <div class="field">
-    <label>淘股吧 Cookie（可选，公开内容不登录也能抓）</label>
-    <input id="taogubaCookie" placeholder="可留空">
-  </div>
-  <div class="field">
-    <label>知识星球 Token（zsxq_access_token，网页版 F12 获取）</label>
-    <input id="zsxqToken" placeholder="粘贴 zsxq_access_token 的值">
-  </div>
-  <div class="field">
-    <label>微信读书 Cookie·公众号（weread.qq.com 网页版 F12 获取；程序会自动续期）</label>
-    <input id="wereadCookie" placeholder="wr_vid=…; wr_skey=…; wr_rt=…; wr_fp=…">
-  </div>
-  <div class="field">
-    <label>书架上的公众号（先在手机 App 里订阅，再点同步）</label>
-    <button class="btn ghost" onclick="syncShelf()">🔄 同步书架</button>
-    <div id="shelfList" style="margin-top:8px"></div>
-  </div>
-
+  <details><summary>各监控对象状态</summary><div class="hint" id="userStatus"></div></details>
   <h3>外观</h3>
   <div class="field">
+    <button class="btn ghost" id="notifyButton">开启新帖浏览器通知</button>
     <label>主题（选择后立即生效并记住）</label>
     <select id="themeSelect">
       <option value="dark">深色</option>
@@ -101,15 +95,15 @@
     <input id="interval" type="number" min="30">
   </div>
   <div class="field">
-    <label>访问密码（留空 = 不需要密码；部署到公网务必设置）</label>
-    <input id="accessPassword" placeholder="留空则不启用">
+    <label>本机访问密码（仅支持本机使用）</label>
+    <input id="accessPassword" type="password" autocomplete="new-password" placeholder="留空保持不变；编辑后清空可关闭">
   </div>
 
   <div class="btn-row">
     <button class="btn" onclick="saveSettings()">保存</button>
     <button class="btn ghost" onclick="closeSettings()">取消</button>
   </div>
-  <div class="hint">凭证只保存在本程序所在目录的 data/config.json，不会上传任何地方。</div>
+  <div class="hint">凭据与浏览器会话仅保存在本机 data 目录；登录及抓取时会发送给对应平台。分享程序不要包含 data。</div>
 </div>
 
 <div class="lightbox" id="lightbox"><img src=""></div>

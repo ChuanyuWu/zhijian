@@ -61,18 +61,22 @@ class WereadCrawler(BaseCrawler):
         """续期并把新凭证写回 config。实测 {"ql": False} 才正确。"""
         try:
             r = client.post(f"{BASE}/web/login/renewal", json={"ql": False})
-            if '"succ"' not in r.text:
+            result = r.json()
+            if not isinstance(result, dict) or result.get('succ') not in (True, 1):
                 return
         except Exception:
             return
-        new = "; ".join(f"{k}={v}" for k, v in client.cookies.items())
+        values = {c.name: c.value for c in client.cookies.jar}
+        values.update({c.name: c.value for c in r.cookies.jar})
+        client.cookies.clear()
+        for key, value in values.items():
+            client.cookies.set(key, value, domain='.weread.qq.com')
+        new = "; ".join(f"{k}={v}" for k, v in values.items())
         if new and new != self.credential:
             try:
-                from config import load_config, save_config
-                cfg = load_config()
-                cfg["weread_cookie"] = new
-                save_config(cfg)
-                self.credential = new
+                from config import replace_credential
+                if replace_credential("weread_cookie", self.credential, new):
+                    self.credential = new
             except Exception:
                 pass
 
@@ -207,3 +211,12 @@ class WereadCrawler(BaseCrawler):
         h = lh.tostring(n, encoding="unicode", method="html")
         h = h[h.find(">") + 1:h.rfind("</div>")]
         return h, images
+
+
+    def fetch_article_by_id(self, review_id):
+        with self._client() as c:
+            self._renew_and_persist(c)
+            r = c.get(f"{BASE}/web/mp/content", params={"reviewId": review_id})
+            r.raise_for_status()
+            content, images = self._parse_article_html(r.text)
+            return {"content_html": content, "images": images}

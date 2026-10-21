@@ -1,15 +1,11 @@
 @echo off
-cd /d %~dp0
-echo Creating virtualenv and installing dependencies (one time only)...
+cd /d "%~dp0"
 python -m venv .venv
-if errorlevel 1 (
-    echo.
-    echo [ERROR] python not found. Install Python 3.10+ from python.org
-    echo and CHECK "Add python.exe to PATH" during install.
-    pause
-    exit /b
-)
-.venv\Scripts\python.exe -m pip install -r requirements.txt -q
-echo.
-echo Done! From now on just double-click start.bat
+if errorlevel 1 exit /b 1
+.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
+if errorlevel 1 exit /b 1
+set "PLAYWRIGHT_BROWSERS_PATH=%CD%\browsers"
+.venv\Scripts\python.exe -m playwright install chromium
+if errorlevel 1 exit /b 1
+echo Installed. Run start.bat.
 pause

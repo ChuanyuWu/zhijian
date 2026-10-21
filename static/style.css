@@ -257,3 +257,13 @@ a:hover { text-decoration: underline; }
 }
 .card:hover .del-btn { opacity: 1; }
 .del-btn:hover { color: #b91c1c; }
+
+.connection-card { border:1px solid var(--border); border-radius:8px; padding:12px; margin:10px 0; }
+.connection-state { float:right; color:var(--accent); font-size:12px; }
+.connection-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+.connection-actions .btn, .user-row .btn { padding:6px 10px; font-size:12px; }
+button:disabled { opacity:.5; cursor:wait; }
+.manual-credentials { margin:20px 0; }
+summary { cursor:pointer; color:var(--accent); font-size:13px; margin:12px 0; }
+.fulltext-error { color:var(--danger); }
+.add-row input, .add-row select { min-width:0; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:8px; }

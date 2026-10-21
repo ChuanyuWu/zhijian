@@ -1,509 +1,193 @@
-/* 帖子监控 前端逻辑：时间流 + SSE 实时推送 + 设置管理 */
-const PLATFORM_NAMES = { weibo: "微博", taoguba: "淘股吧", zsxq: "知识星球", weread: "公众号" };
-
-let currentPlatform = "";
-let currentKeyword = "";
-let currentAuthor = "";          // "platform:user_id"，空 = 不按人筛选
-let newestIds = new Set();
-let pendingNew = [];
-let userProfiles = {};           // "platform:user_id" -> {nickname, avatar}
-let loadedCount = 0;
-
-/* ---------- 工具 ---------- */
-function fmtTime(iso) {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (isNaN(d)) return iso;
-  const now = new Date();
-  const sameDay = d.toDateString() === now.toDateString();
-  const pad = (n) => String(n).padStart(2, "0");
-  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  if (sameDay) return hm;
-  return `${d.getMonth() + 1}-${pad(d.getDate())} ${hm}`;
-}
-
-function esc(s) {
-  const div = document.createElement("div");
-  div.textContent = s || "";
-  return div.innerHTML;
-}
-
-function toast(msg, color) {
-  const t = document.getElementById("toast");
-  t.textContent = msg;
-  t.style.background = color || "#238636";
-  t.style.display = "block";
-  setTimeout(() => (t.style.display = "none"), 2200);
-}
-
-/* 图片统一走后端代理，绕开平台防盗链 */
-function pimg(url) {
-  return "/api/img?url=" + encodeURIComponent(url);
-}
-
-/* ---------- 头像 ---------- */
-function avatarHtml(p, size) {
-  const key = `${p.platform}:${p.author_id || p.user_id}`;
-  const prof = userProfiles[key] || {};
-  const name = p.author_name || prof.nickname || p.nickname || "?";
-  if (prof.avatar) {
-    return `<img class="avatar" style="width:${size}px;height:${size}px"
-      src="${pimg(prof.avatar)}" referrerpolicy="no-referrer"
-      onerror="this.outerHTML=avatarPlaceholder('${p.platform}','${esc(name[0])}',${size})">`;
+/* Local feed and connection wizard. Dynamic UI uses delegated events, not inline JS. */
+const PLATFORM_NAMES = {weibo:'微博', taoguba:'淘股吧', zsxq:'知识星球', weread:'公众号'};
+const CREDENTIAL_IDS = {weibo_cookie:'weiboCookie', taoguba_cookie:'taogubaCookie', zsxq_token:'zsxqToken', weread_cookie:'wereadCookie', access_password:'accessPassword'};
+let currentPlatform='', currentKeyword='', currentAuthor='', loadedCount=0;
+let settingsCache={users:[]}, userProfiles={}, pendingNew=new Map(), posts=new Map();
+let loadVersion=0, feedAbort=null, drawerOpen=false, connections={};
+const dirtySecrets=new Set();
+const $ = id => document.getElementById(id);
+function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function pimg(url) { return '/api/img?url='+encodeURIComponent(url); }
+function plainText(html) { const d=document.createElement('div'); d.innerHTML=html||''; return (d.textContent||'').trim(); }
+function toast(message, color='#238636') { $('toast').textContent=message; $('toast').style.background=color; $('toast').style.display='block'; setTimeout(()=>$('toast').style.display='none',4000); }
+async function api(path, options={}) {
+  const r=await fetch(path, {headers:{'Content-Type':'application/json'}, ...options});
+  const data=await r.json().catch(()=>({detail:'服务器返回异常，请重试'}));
+  if (!r.ok) {
+    if (r.status===401 && data.detail==='请重新登录') location.href='/login';
+    throw new Error(typeof data.detail==='string' ? data.detail : '设置格式不正确，请检查用户 ID 和轮询间隔');
   }
-  return avatarPlaceholder(p.platform, esc(name[0]), size);
-}
-
-function avatarPlaceholder(platform, ch, size) {
-  return `<span class="avatar avatar-ph ${platform}" style="width:${size}px;height:${size}px;font-size:${Math.round(size * 0.45)}px">${ch}</span>`;
-}
-
-async function loadProfiles() {
-  try {
-    const r = await fetch("/api/settings");
-    const cfg = await r.json();
-    userProfiles = {};
-    for (const u of cfg.users || []) {
-      userProfiles[`${u.platform}:${u.user_id}`] = { nickname: u.nickname, avatar: u.avatar };
-    }
-  } catch (e) {}
-}
-
-/* ---------- 渲染 ---------- */
-const COLLAPSE_LEN = 400;   // 正文超过此字数默认折叠
-let cardSeq = 0;
-const postCache = {};
-
-function plainText(html) {
-  const d = document.createElement("div");
-  d.innerHTML = html || "";
-  return (d.textContent || "").trim();
-}
-
-/* 显示前整理 HTML（DOM 级清洗，新旧数据都受益）：
-   - 移除无文本无图的空元素
-   - 去掉块级元素开头的 <br>（淘股吧正文每段自带前置换行，会双倍行距）
-   - 连续 3 个以上 <br> 压成两个 */
-function tidyHtml(html) {
-  const d = document.createElement("div");
-  d.innerHTML = html || "";
-  d.querySelectorAll("div,font,span,p").forEach((el) => {
-    if (!el.textContent.trim() && !el.querySelector("img")) el.remove();
-  });
-  d.querySelectorAll("div,font,p,span").forEach((el) => {
-    while (el.firstChild && el.firstChild.nodeName === "BR") el.firstChild.remove();
-  });
-  return d.innerHTML
-    .replace(/(<br\s*\/?>\s*){3,}/gi, "<br><br>")
-    .replace(/^\s*(<br\s*\/?>\s*)+/i, "");
-}
-
-function imagesHtml(urls) {
-  const cls = urls.length === 1 ? "card-images one" : "card-images";
-  return `<div class="${cls}">` + urls.map((u) =>
-    `<img src="${pimg(u)}" loading="lazy" decoding="async" onclick="zoom('${pimg(u)}')">`
-  ).join("") + "</div>";
-}
-
-function toggleExpand(btn, uid) {
-  const card = btn.closest(".card");
-  const wrap = card.querySelector(".collapsible");
-  const p = postCache[uid];
-  const imgCount = p && p.images ? p.images.length : 0;
-  if (wrap.classList.contains("collapsed")) {
-    wrap.classList.remove("collapsed");
-    // 展开时才渲染图片，避免折叠状态就发起大量图片请求
-    const slot = card.querySelector(".img-slot");
-    if (slot && imgCount) slot.outerHTML = imagesHtml(p.images);
-    btn.textContent = "收起 ▴";
-  } else {
-    wrap.classList.add("collapsed");
-    btn.textContent = `展开全文${imgCount ? " · 附图 " + imgCount + " 张" : ""} ▾`;
-  }
-}
-
-function cardHtml(p) {
-  const uid = ++cardSeq;
-  postCache[uid] = p;
-  const badge = `<span class="badge ${p.platform}">${PLATFORM_NAMES[p.platform] || p.platform}</span>`;
-  const title = p.title ? `<div class="card-title">${esc(p.title)}</div>` : "";
-  const text = plainText(p.content_html);
-  const needCollapse = text.length > COLLAPSE_LEN;
-  const imgCount = (p.images || []).length;
-
-  let body = "";
-  if (p.content_html) {
-    const content = tidyHtml(p.content_html);
-    body = needCollapse
-      ? `<div class="collapsible collapsed"><div class="card-body">${content}</div><div class="fade"></div></div>`
-      : `<div class="card-body">${content}</div>`;
-  } else if (!p.title) {
-    body = `<div class="card-body" style="color:var(--text-dim)">（正文暂未抓取，点原文查看）</div>`;
-  }
-
-  let imgs = "";
-  if (imgCount) {
-    // 折叠的帖子不渲染图片，点开才加载
-    imgs = needCollapse ? `<div class="img-slot"></div>` : imagesHtml(p.images);
-  }
-  const expandBtn = needCollapse
-    ? `<button class="expand-btn" onclick="toggleExpand(this, ${uid})">展开全文${imgCount ? " · 附图 " + imgCount + " 张" : ""} ▾</button>`
-    : "";
-
-  const link = p.url ? `<a href="${esc(p.url)}" target="_blank" rel="noopener">查看原文 ↗</a>` : "";
-  const authorKey = `${p.platform}:${p.author_id}`;
-  return `<div class="card" data-id="${p.id || ""}" data-uid="${uid}">
-    <div class="card-head">${avatarHtml(p, 34)}${badge}
-      <span class="author" onclick="filterAuthor('${authorKey}')" title="只看 TA 的帖子">${esc(p.author_name || p.author_id)}</span>
-      <span class="time">${fmtTime(p.published_at)}</span>
-      ${p.id ? `<button class="del-btn" onclick="delPost(${p.id}, this)" title="删除这条帖子">×</button>` : ""}
-    </div>
-    ${title}${body}${imgs}${expandBtn}
-    <div class="card-foot">${link}</div>
-  </div>`;
-}
-
-async function delPost(id, btn) {
-  if (!confirm("删除这条帖子？（不影响其他帖子）")) return;
-  const r = await fetch(`/api/posts/${id}`, { method: "DELETE" });
-  if (r.ok) {
-    btn.closest(".card").remove();
-    toast("已删除");
-  } else {
-    toast("删除失败", "#b91c1c");
-  }
-}
-
-function zoom(url) {
-  const lb = document.getElementById("lightbox");
-  lb.querySelector("img").src = url;
-  lb.style.display = "flex";
-}
-document.getElementById("lightbox").onclick = function () { this.style.display = "none"; };
-
-/* ---------- 按人筛选 ---------- */
-function filterAuthor(key) {
-  currentAuthor = key;
-  const prof = userProfiles[key] || {};
-  const name = prof.nickname || key.split(":")[1];
-  const chip = document.getElementById("authorChip");
-  chip.style.display = "inline-flex";
-  chip.querySelector("span").textContent = `正在看：${name}`;
-  loadPosts();
-  window.scrollTo({ top: 0, behavior: "smooth" });
-}
-
-function clearAuthor() {
-  currentAuthor = "";
-  document.getElementById("authorChip").style.display = "none";
-  loadPosts();
-}
-document.getElementById("authorChip").onclick = clearAuthor;
-
-/* ---------- 数据加载 ---------- */
-async function loadPosts(offset = 0, replace = true) {
-  const params = new URLSearchParams();
-  if (currentPlatform) params.set("platform", currentPlatform);
-  if (currentKeyword) params.set("q", currentKeyword);
-  if (currentAuthor) params.set("author", currentAuthor);
-  if (offset) params.set("offset", offset);
-  const r = await fetch("/api/posts?" + params);
-  const data = await r.json();
-  const feed = document.getElementById("feed");
-  if (replace) {
-    feed.querySelectorAll(".card").forEach((e) => e.remove());
-    newestIds.clear();
-    loadedCount = 0;
-  }
-  if (!data.posts.length && replace) {
-    document.getElementById("empty").style.display = "block";
-  } else {
-    document.getElementById("empty").style.display = "none";
-  }
-  for (const p of data.posts) {
-    feed.insertAdjacentHTML("beforeend", cardHtml(p));
-    if (p.id) newestIds.add(p.id);
-  }
-  loadedCount += data.posts.length;
-  document.getElementById("loadMore").style.display = data.posts.length >= 30 ? "block" : "none";
   return data;
 }
-
-function loadMore() {
-  loadPosts(loadedCount, false);
+function fmtTime(iso) {
+  const d=new Date(iso); if(!iso || isNaN(d)) return iso||'';
+  return d.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
 }
-
-/* ---------- SSE 实时推送 ---------- */
-function connectStream() {
-  const es = new EventSource("/api/stream");
-  es.onmessage = (ev) => {
-    const p = JSON.parse(ev.data);
-    if (currentPlatform && p.platform !== currentPlatform) return;
-    if (currentAuthor && `${p.platform}:${p.author_id}` !== currentAuthor) return;
-    pendingNew.push(p);
-    showNewTip();
-    notify(p);
-  };
-  es.onerror = () => { es.close(); setTimeout(connectStream, 5000); };
+function avatarPlaceholder(platform,ch,size) { return `<span class="avatar avatar-ph ${esc(platform)}" style="width:${size}px;height:${size}px">${esc(ch)}</span>`; }
+function avatarHtml(p,size) {
+  const profile=userProfiles[`${p.platform}:${p.author_id||p.user_id}`]||{};
+  const name=p.author_name||profile.nickname||p.nickname||'?';
+  return profile.avatar ? `<img class="avatar" width="${size}" height="${size}" src="${pimg(profile.avatar)}" alt="${esc(name[0])}">` : avatarPlaceholder(p.platform,name[0],size);
 }
-
-function showNewTip() {
-  const tip = document.getElementById("newTip");
-  tip.style.display = "block";
-  tip.querySelector("span").textContent = `有 ${pendingNew.length} 条新帖，点击刷新`;
+document.addEventListener('error',e=>{if(e.target.matches?.('img.avatar')) e.target.replaceWith(document.createTextNode(e.target.alt||'?'));},true);
+async function loadProfiles() {
+  const cfg=await api('/api/settings'); userProfiles={};
+  for(const u of cfg.users||[]) userProfiles[`${u.platform}:${u.user_id}`]={nickname:u.nickname,avatar:u.avatar};
+  return cfg;
 }
-
-document.getElementById("newTip").onclick = () => {
-  const feed = document.getElementById("feed");
-  for (const p of pendingNew) feed.insertAdjacentHTML("afterbegin", cardHtml(p));
-  pendingNew = [];
-  document.getElementById("newTip").style.display = "none";
-  window.scrollTo({ top: 0, behavior: "smooth" });
-};
-
-/* ---------- 浏览器通知 ---------- */
-async function notify(p) {
-  if (!("Notification" in window)) return;
-  if (Notification.permission !== "granted") return;
-  const text = p.title || p.content_html.replace(/<[^>]+>/g, "").slice(0, 80);
-  new Notification(`${PLATFORM_NAMES[p.platform]} · ${p.author_name || ""}`, { body: text });
+function tidyHtml(html) {
+  const d=document.createElement('div'); d.innerHTML=html||'';
+  // Defense in depth; the server applies the authoritative HTML whitelist.
+  d.querySelectorAll('script,style,iframe,object,embed,form,svg,math').forEach(e=>e.remove());
+  d.querySelectorAll('*').forEach(e=>{for(const a of [...e.attributes]) if(a.name.startsWith('on')||a.name==='style')e.removeAttribute(a.name);});
+  d.querySelectorAll('a').forEach(a=>{if(!/^https?:\/\//i.test(a.getAttribute('href')||'')) a.removeAttribute('href');});
+  d.querySelectorAll('div,font,span,p').forEach(e=>{if(!e.textContent.trim()&&!e.querySelector('img'))e.remove();});
+  return d.innerHTML.replace(/(<br\s*\/?>\s*){3,}/gi,'<br><br>');
 }
-
-async function ensureNotifyPermission() {
-  if ("Notification" in window && Notification.permission === "default") {
-    await Notification.requestPermission();
-  }
+function imagesHtml(urls) {
+  return `<div class="card-images${urls.length===1?' one':''}">`+urls.map(u=>`<img src="${pimg(u)}" data-action="zoom" loading="lazy" decoding="async" alt="帖子配图">`).join('')+'</div>';
 }
-
-/* ---------- 状态轮询 ---------- */
-async function refreshStatus() {
-  const r = await fetch("/api/status");
-  const data = await r.json();
-  const bar = document.getElementById("statusBar");
-  const banner = document.getElementById("banner");
-  let html = `📦 已存 ${data.total} 条`;
-  let alertMsg = "";
-  for (const [k, st] of Object.entries(data.status)) {
-    let label = PLATFORM_NAMES[k];
-    if (st.state === "ok") html += ` <span class="st"><span class="dot"></span>${label}正常 ${st.last_run || ""}</span>`;
-    else if (st.state === "rate_limited") html += ` <span class="st"><span class="dot warn"></span>${label}限流中</span>`;
-    else if (st.state === "auth_error") { html += ` <span class="st"><span class="dot err"></span>${label}凭证失效</span>`; alertMsg += `${label}：${st.message}　`; }
-    else if (st.state === "error") html += ` <span class="st"><span class="dot err"></span>${label}异常</span>`;
-    else html += ` <span class="st"><span class="dot gray"></span>${label}${st.state === "reserved" ? "预留" : "未启用"}</span>`;
-  }
-  bar.innerHTML = html;
-  if (alertMsg) { banner.textContent = "⚠️ " + alertMsg + "请到设置页更新凭证"; banner.classList.add("show"); }
-  else banner.classList.remove("show");
+function cardHtml(p, expanded=false) {
+  posts.set(Number(p.id),p);
+  const collapse=plainText(p.content_html).length>400 && !expanded;
+  const count=(p.images||[]).length;
+  const content=tidyHtml(p.content_html);
+  return `<article class="card" data-id="${Number(p.id)}">
+    <div class="card-head">${avatarHtml(p,34)}<span class="badge ${esc(p.platform)}">${esc(PLATFORM_NAMES[p.platform]||p.platform)}</span>
+    <span class="author" data-action="author" data-key="${esc(p.platform+':'+p.author_id)}">${esc(p.author_name||p.author_id)}</span>
+    <span class="time">${esc(fmtTime(p.published_at))}</span><button class="del-btn" data-action="delete" title="删除帖子">×</button></div>
+    ${p.title?`<div class="card-title">${esc(p.title)}</div>`:''}
+    <div class="collapsible ${collapse?'collapsed':''}"><div class="card-body">${content||'（正文暂未抓取，可查看原文）'}</div><div class="fade"></div></div>
+    <div class="img-slot">${collapse?'':imagesHtml(p.images||[])}</div>
+    ${plainText(p.content_html).length>400?`<button class="expand-btn" data-action="expand">${collapse?'展开已获取正文 ▾':'收起 ▴'}</button>`:''}
+    ${p.needs_fulltext?'<button class="expand-btn" data-action="fulltext">获取全文</button>':''}
+    <div class="fulltext-error hint" role="status"></div>
+    <div class="card-foot">${p.url?`<a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">查看原文 ↗</a>`:''}</div></article>`;
 }
-
-/* ---------- 设置抽屉 ---------- */
-function openSettings() {
-  document.getElementById("drawer").classList.add("open");
-  document.getElementById("drawerMask").classList.add("open");
-  loadSettings();
-}
-function closeSettings() {
-  document.getElementById("drawer").classList.remove("open");
-  document.getElementById("drawerMask").classList.remove("open");
-}
-
-let settingsCache = null;
-
-async function loadSettings() {
-  const r = await fetch("/api/settings");
-  const cfg = await r.json();
-  settingsCache = cfg;
-  document.getElementById("weiboCookie").value = cfg.weibo_cookie;
-  document.getElementById("taogubaCookie").value = cfg.taoguba_cookie;
-  document.getElementById("zsxqToken").value = cfg.zsxq_token;
-  document.getElementById("wereadCookie").value = cfg.weread_cookie || "";
-  document.getElementById("accessPassword").value = cfg.access_password;
-  document.getElementById("interval").value = cfg.poll_interval_sec;
-  renderUserList(cfg.users || []);
-}
-
-function renderUserList(users) {
-  const box = document.getElementById("userList");
-  box.innerHTML = users.map((u, i) => `
-    <div class="user-row">
-      ${avatarHtml({ platform: u.platform, user_id: u.user_id, nickname: u.nickname }, 26)}
-      <span class="badge ${u.platform}">${PLATFORM_NAMES[u.platform] || u.platform}</span>
-      <span class="grow">${esc(u.nickname || u.user_id)} <small style="color:var(--text-dim)">${esc(u.user_id)}</small></span>
-      <button class="del" onclick="delUser(${i})">✕</button>
-    </div>`).join("") || `<div class="hint">还没有监控用户，在下方添加</div>`;
-}
-
-function delUser(i) {
-  settingsCache.users.splice(i, 1);
-  renderUserList(settingsCache.users);
-}
-
-async function addUser() {
-  const platform = document.getElementById("newPlatform").value;
-  let uid = document.getElementById("newUid").value.trim();
-  if (!uid) return toast("请填写用户 ID", "#b91c1c");
-  let nickname = "", avatar = "";
+async function fetchFulltext(card) {
+  if(card.dataset.loading==='1')return;
+  card.dataset.loading='1'; const message=card.querySelector('.fulltext-error');
+  message.textContent='正在获取全文…';
   try {
-    const r = await fetch("/api/users/resolve", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ platform, user_id: uid }),
-    });
-    if (r.ok) {
-      const d = await r.json();
-      nickname = d.nickname; avatar = d.avatar;
-      if (platform === "weread" && d.user_id) uid = d.user_id;
-    }
-  } catch (e) {}
-  settingsCache.users = settingsCache.users || [];
-  if (settingsCache.users.some((u) => u.platform === platform && u.user_id === uid))
-    return toast("该用户已在列表中", "#b91c1c");
-  settingsCache.users.push({ platform, user_id: uid, nickname, avatar, enabled: true });
-  renderUserList(settingsCache.users);
-  document.getElementById("newUid").value = "";
+    const data=await api(`/api/posts/${card.dataset.id}/fulltext`,{method:'POST',body:'{}'});
+    card.outerHTML=cardHtml(data.post,true);
+  } catch(e) { message.textContent=e.message+'。可以再次点击全文重试，或查看原文。'; }
+  finally { delete card.dataset.loading; }
 }
-
-/* ---------- 公众号·微信读书书架同步 ---------- */
-async function syncShelf() {
-  const box = document.getElementById("shelfList");
-  box.innerHTML = `<div class="hint">正在读取书架…</div>`;
-  try {
-    const r = await fetch("/api/weread/shelf");
-    const d = await r.json();
-    if (!r.ok) { box.innerHTML = `<div class="hint">⚠️ ${esc(d.detail || "读取失败")}</div>`; return; }
-    const accs = d.accounts || [];
-    if (!accs.length) {
-      box.innerHTML = `<div class="hint">书架上还没有公众号。先在手机微信读书 App 搜索并订阅，再回来点同步。</div>`;
-      return;
-    }
-    settingsCache.users = settingsCache.users || [];
-    box.innerHTML = accs.map((a, i) => {
-      const added = settingsCache.users.some((u) => u.platform === "weread" && u.user_id === a.user_id);
-      return `<div class="user-row">
-        ${a.avatar ? `<img class="avatar" style="width:26px;height:26px" src="${pimg(a.avatar)}" onerror="this.outerHTML=avatarPlaceholder('weread','${esc((a.nickname||'?')[0])}',26)">` : avatarPlaceholder("weread", esc((a.nickname || "?")[0]), 26)}
-        <span class="grow">${esc(a.nickname)}</span>
-        ${added ? `<span class="hint">已添加</span>` : `<button class="btn ghost" onclick="addShelfUser(${i})">＋ 添加</button>`}
-      </div>`;
-    }).join("");
-    box.dataset.accs = JSON.stringify(accs);
-  } catch (e) {
-    box.innerHTML = `<div class="hint">读取书架失败，请重试</div>`;
+$('feed').addEventListener('click',async e=>{
+  const card=e.target.closest('.card'); if(!card)return;
+  const p=posts.get(Number(card.dataset.id));
+  const a=e.target.closest('.card-body a');
+  if(p?.platform==='weibo'&&a&&a.textContent.includes('全文')) {e.preventDefault();await fetchFulltext(card);return;}
+  const target=e.target.closest('[data-action]'); if(!target)return;
+  const action=target.dataset.action;
+  if(action==='fulltext')await fetchFulltext(card);
+  if(action==='expand') {
+    const wrap=card.querySelector('.collapsible'); const collapsed=wrap.classList.toggle('collapsed');
+    target.textContent=collapsed?'展开已获取正文 ▾':'收起 ▴';
+    if(!collapsed)card.querySelector('.img-slot').innerHTML=imagesHtml(p.images||[]);
   }
-}
-
-function addShelfUser(i) {
-  const accs = JSON.parse(document.getElementById("shelfList").dataset.accs || "[]");
-  const a = accs[i];
-  if (!a) return;
-  settingsCache.users = settingsCache.users || [];
-  if (!settingsCache.users.some((u) => u.platform === "weread" && u.user_id === a.user_id)) {
-    settingsCache.users.push({ platform: "weread", user_id: a.user_id, nickname: a.nickname, avatar: a.avatar, enabled: true });
-    renderUserList(settingsCache.users);
-    toast(`已加入「${a.nickname}」，点「保存」生效`);
+  if(action==='zoom')zoom(target.src);
+  if(action==='author')filterAuthor(target.dataset.key);
+  if(action==='delete'&&confirm('删除这条帖子？')) {
+    try{await api(`/api/posts/${p.id}`,{method:'DELETE',body:'{}'});await loadPosts();toast('已删除');}catch(e){toast(e.message,'#b91c1c');}
   }
-  syncShelf();
-}
-
-/* ---------- 导出/导入监控列表（只含用户清单，不含任何凭证） ---------- */
-function exportUsers() {
-  const users = (settingsCache.users || []).map((u) => ({
-    platform: u.platform, user_id: u.user_id, nickname: u.nickname, avatar: u.avatar, enabled: u.enabled,
-  }));
-  if (!users.length) return toast("列表是空的", "#b91c1c");
-  const blob = new Blob([JSON.stringify(users, null, 2)], { type: "application/json" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = "监控列表.json";
-  a.click();
-  URL.revokeObjectURL(a.href);
-  toast("已导出，把这个 json 发给朋友即可");
-}
-
-function importUsers(input) {
-  const file = input.files[0];
-  input.value = "";
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => {
-    try {
-      const list = JSON.parse(reader.result);
-      if (!Array.isArray(list)) throw new Error("格式不对");
-      settingsCache.users = settingsCache.users || [];
-      let added = 0;
-      for (const u of list) {
-        if (!u.platform || !u.user_id) continue;
-        if (settingsCache.users.some((x) => x.platform === u.platform && x.user_id === u.user_id)) continue;
-        settingsCache.users.push({
-          platform: u.platform, user_id: String(u.user_id),
-          nickname: u.nickname || "", avatar: u.avatar || "", enabled: u.enabled !== false,
-        });
-        added++;
-      }
-      renderUserList(settingsCache.users);
-      toast(added ? `导入成功 ${added} 人，点「保存」生效` : "列表里的人你都已有");
-    } catch (e) {
-      toast("导入失败：文件格式不对", "#b91c1c");
-    }
-  };
-  reader.readAsText(file);
-}
-
-async function saveSettings() {
-  const body = {
-    weibo_cookie: document.getElementById("weiboCookie").value.trim(),
-    taoguba_cookie: document.getElementById("taogubaCookie").value.trim(),
-    zsxq_token: document.getElementById("zsxqToken").value.trim(),
-    weread_cookie: document.getElementById("wereadCookie").value.trim(),
-    access_password: document.getElementById("accessPassword").value,
-    poll_interval_sec: parseInt(document.getElementById("interval").value) || 120,
-    users: settingsCache.users || [],
-  };
-  const r = await fetch("/api/settings", {
-    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-  });
-  if (r.ok) {
-    toast("已保存，下一轮轮询生效");
-    closeSettings();
-    await loadProfiles();
-    refreshStatus();
-  }
-  else toast("保存失败", "#b91c1c");
-}
-
-/* ---------- 顶栏事件 ---------- */
-document.querySelectorAll(".tab").forEach((t) => {
-  t.onclick = () => {
-    document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
-    t.classList.add("active");
-    currentPlatform = t.dataset.platform;
-    pendingNew = [];
-    document.getElementById("newTip").style.display = "none";
-    loadPosts();
-  };
 });
-
-let searchTimer;
-document.getElementById("searchBox").oninput = (e) => {
-  clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => { currentKeyword = e.target.value.trim(); loadPosts(); }, 400);
-};
-
-/* ---------- 主题 ---------- */
-function applyTheme(t) {
-  document.documentElement.dataset.theme = t;
-  localStorage.setItem("pm-theme", t);
-  const sel = document.getElementById("themeSelect");
-  if (sel) sel.value = t;
+function zoom(url){$('lightbox').querySelector('img').src=url;$('lightbox').style.display='flex';}
+$('lightbox').onclick=()=>$('lightbox').style.display='none';
+function clearPending(){pendingNew.clear();$('newTip').style.display='none';}
+function filterAuthor(key){currentAuthor=key;$('authorChip').style.display='inline-flex';$('authorChip').querySelector('span').textContent='正在看：'+(userProfiles[key]?.nickname||key.split(':')[1]);loadPosts().catch(showError);}
+function clearAuthor(){currentAuthor='';$('authorChip').style.display='none';loadPosts().catch(showError);}
+$('authorChip').onclick=clearAuthor;
+function showError(e){if(e.name!=='AbortError')toast(e.message,'#b91c1c');}
+async function loadPosts(offset=0,replace=true) {
+  if(replace){feedAbort?.abort();feedAbort=new AbortController();++loadVersion;clearPending();}
+  const version=loadVersion;
+  const params=new URLSearchParams({platform:currentPlatform,q:currentKeyword,author:currentAuthor,offset:String(offset)});
+  $('loadMore').disabled=true;
+  try{
+    const data=await api('/api/posts?'+params,{signal:feedAbort?.signal});
+    if(version!==loadVersion)return;
+    if(replace){$('feed').querySelectorAll('.card').forEach(e=>e.remove());posts.clear();loadedCount=0;}
+    for(const p of data.posts)if(!posts.has(Number(p.id)))$('feed').insertAdjacentHTML('beforeend',cardHtml(p));
+    loadedCount+=data.posts.length;
+    $('empty').style.display=posts.size?'none':'block';
+    $('loadMore').style.display=data.posts.length>=30?'block':'none';
+  }finally{if(version===loadVersion)$('loadMore').disabled=false;}
 }
-document.getElementById("themeSelect").onchange = (e) => applyTheme(e.target.value);
-applyTheme(localStorage.getItem("pm-theme") || "dark");
-
-/* ---------- 启动 ---------- */
-(async function init() {
-  ensureNotifyPermission();
-  await loadProfiles();
-  await loadPosts();
-  refreshStatus();
-  setInterval(refreshStatus, 30000);
-  setInterval(loadProfiles, 60000);
-  connectStream();
-})();
+function loadMore(){loadPosts(loadedCount,false).catch(showError);}
+function matches(p){return (!currentPlatform||p.platform===currentPlatform)&&(!currentAuthor||`${p.platform}:${p.author_id}`===currentAuthor)&&(!currentKeyword||[plainText(p.content_html),p.title,p.author_name].some(x=>(x||'').toLowerCase().includes(currentKeyword.toLowerCase())));}
+function connectStream(){
+  const es=new EventSource('/api/stream');
+  es.onmessage=ev=>{try{const p=JSON.parse(ev.data);if(matches(p)&&!posts.has(Number(p.id))&&!pendingNew.has(p.id)){pendingNew.set(p.id,p);$('newTip').style.display='block';$('newTip').querySelector('span').textContent=`有 ${pendingNew.size} 条新帖，点击刷新`;notify(p);}}catch(e){/* Ignore malformed event. */}};
+  // EventSource handles reconnection; no parallel manual reconnect loops.
+}
+$('newTip').onclick=()=>{loadPosts().catch(showError);window.scrollTo({top:0,behavior:'smooth'});};
+function notify(p){if('Notification'in window&&Notification.permission==='granted')new Notification(`${PLATFORM_NAMES[p.platform]} · ${p.author_name||''}`,{body:p.title||plainText(p.content_html).slice(0,80)});}
+async function refreshStatus(){
+  const data=await api('/api/status'); let html=`📦 已存 ${data.total} 条`,alerts=[];
+  const labels={ok:'正常',disabled:'未启用',pending:'等待抓取',auth_error:'登录失效',rate_limited:'限流中',error:'异常',partial_error:'部分异常'};
+  for(const [key,st]of Object.entries(data.status)){
+    const color=st.state==='ok'?'':st.state==='disabled'||st.state==='pending'?'gray':st.state==='rate_limited'?'warn':'err';
+    html+=` <span class="st" title="${esc(st.message)}"><span class="dot ${color}"></span>${esc(PLATFORM_NAMES[key])}${esc(labels[st.state]||st.state)}</span>`;
+    for(const u of st.users||[])if(u.state==='auth_error')alerts.push(`${PLATFORM_NAMES[key]}：登录已失效，请重新连接`);
+  }
+  $('statusBar').innerHTML=html;$('banner').textContent=[...new Set(alerts)].join('；');$('banner').classList.toggle('show',alerts.length>0);
+  if(drawerOpen){$('userStatus').innerHTML=Object.entries(data.status).flatMap(([k,s])=>(s.users||[]).map(u=>`<div>${esc(PLATFORM_NAMES[k])} · ${esc(u.nickname||u.user_id)}：${esc(labels[u.state]||u.state)} ${esc(u.message||'')}</div>`)).join('');}
+}
+async function openSettings(){
+  drawerOpen=true;$('drawer').scrollTop=0;$('drawer').classList.add('open');$('drawerMask').classList.add('open');
+  try{
+    const cfg=await loadProfiles();settingsCache=structuredClone(cfg);dirtySecrets.clear();
+    for(const [key,id]of Object.entries(CREDENTIAL_IDS)){$(id).value='';$(id).placeholder=cfg[key]?'已保存；留空保持不变':'尚未配置';}
+    $('interval').value=cfg.poll_interval_sec;renderUserList(cfg.users||[]);await refreshConnections();await refreshStatus();
+  }catch(e){showError(e);}
+}
+function closeSettings(){drawerOpen=false;$('drawer').classList.remove('open');$('drawerMask').classList.remove('open');}
+for(const [key,id]of Object.entries(CREDENTIAL_IDS))$(id).addEventListener('input',()=>dirtySecrets.add(key));
+function renderUserList(users){$('userList').innerHTML=users.map((u,i)=>`<div class="user-row"><span class="badge ${esc(u.platform)}">${esc(PLATFORM_NAMES[u.platform])}</span><span class="grow">${esc(u.nickname||u.user_id)} <small>${esc(u.user_id)}</small></span><button data-toggle-user="${i}" class="btn ghost">${u.enabled===false?'启用':'暂停'}</button><button class="del" data-delete-user="${i}">×</button></div>`).join('')||'<div class="hint">连接平台后，在下方添加监控对象。</div>';}
+$('userList').onclick=e=>{const del=e.target.closest('[data-delete-user]'),toggle=e.target.closest('[data-toggle-user]');if(del)settingsCache.users.splice(Number(del.dataset.deleteUser),1);if(toggle){const u=settingsCache.users[Number(toggle.dataset.toggleUser)];u.enabled=u.enabled===false;}renderUserList(settingsCache.users);};
+async function addUser(){
+  const platform=$('newPlatform').value;let uid=$('newUid').value.trim(),nickname='',avatar='';if(!uid)return toast('请填写用户 ID 或主页链接','#b91c1c');
+  try{const d=await api('/api/users/resolve',{method:'POST',body:JSON.stringify({platform,user_id:uid})});uid=d.user_id;nickname=d.nickname;avatar=d.avatar;}
+  catch(e){if(!confirm(e.message+'。是否仍然添加？保存时会检查 ID 格式。'))return;}
+  settingsCache.users??=[];if(settingsCache.users.some(u=>u.platform===platform&&u.user_id===uid))return toast('该对象已存在');
+  settingsCache.users.push({platform,user_id:uid,nickname,avatar,enabled:true});renderUserList(settingsCache.users);$('newUid').value='';toast('已加入列表，点击保存生效');
+}
+async function syncShelf(){
+  $('shelfList').textContent='正在读取书架…';
+  try{const d=await api('/api/weread/shelf');$('shelfList').dataset.accs=JSON.stringify(d.accounts||[]);$('shelfList').innerHTML=(d.accounts||[]).map((a,i)=>`<div class="user-row"><span class="grow">${esc(a.nickname)}</span><button class="btn ghost" data-shelf="${i}">${settingsCache.users.some(u=>u.platform==='weread'&&u.user_id===a.user_id)?'已添加':'＋ 添加'}</button></div>`).join('')||'<div class="hint">书架没有公众号，请先在手机微信读书 App 订阅。</div>';}
+  catch(e){$('shelfList').textContent=e.message;}
+}
+function addShelfUser(i){const a=JSON.parse($('shelfList').dataset.accs||'[]')[i];if(a&&!settingsCache.users.some(u=>u.platform==='weread'&&u.user_id===a.user_id)){settingsCache.users.push({...a,platform:'weread',enabled:true});renderUserList(settingsCache.users);toast('已加入，点击保存生效');}}
+$('shelfList').onclick=e=>{const b=e.target.closest('[data-shelf]');if(b)addShelfUser(Number(b.dataset.shelf));};
+function exportUsers(){const users=(settingsCache.users||[]).map(({platform,user_id,nickname,avatar,enabled})=>({platform,user_id,nickname,avatar,enabled}));const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(users,null,2)],{type:'application/json'}));a.download='监控列表.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
+function importUsers(input){
+  const file=input.files[0];input.value='';if(!file)return;if(file.size>512000)return toast('列表文件过大','#b91c1c');
+  file.text().then(text=>{const list=JSON.parse(text);if(!Array.isArray(list))throw new Error('格式错误');for(const u of list){if(!PLATFORM_NAMES[u.platform]||!u.user_id)throw new Error('包含无效平台或 ID');if(!settingsCache.users.some(x=>x.platform===u.platform&&x.user_id===String(u.user_id)))settingsCache.users.push({platform:u.platform,user_id:String(u.user_id),nickname:String(u.nickname||''),avatar:String(u.avatar||''),enabled:u.enabled!==false});}renderUserList(settingsCache.users);toast('已导入，点击保存生效');}).catch(()=>toast('导入失败，请检查列表格式','#b91c1c'));
+}
+async function saveSettings(){
+  const body={poll_interval_sec:Number($('interval').value),users:settingsCache.users||[]};
+  for(const key of dirtySecrets)body[key]=$(CREDENTIAL_IDS[key]).value.trim();
+  try{await api('/api/settings',{method:'PUT',body:JSON.stringify(body)});dirtySecrets.clear();closeSettings();toast('已保存，监控即将使用新设置');await loadProfiles();await refreshStatus();}
+  catch(e){showError(e);}
+}
+const CONNECTION_LABELS={unconfigured:'未连接',pending:'待验证',ok:'已连接',public:'公开内容免登录',auth_error:'需重新登录',network_error:'网络异常',rate_limited:'请求受限',error:'连接异常',starting:'正在启动',waiting:'等待登录',cancelled:'已取消',timeout:'登录超时'};
+async function refreshConnections(){connections=await api('/api/connections');renderConnections();}
+function renderConnections(){
+  $('connections').innerHTML=Object.entries(PLATFORM_NAMES).map(([key,name])=>{const st=connections[key]||{state:'unconfigured'},active=['starting','waiting'].includes(st.state);return `<section class="connection-card"><b>${esc(name)}</b><span class="connection-state">${esc(CONNECTION_LABELS[st.state]||st.state)}</span><div class="hint">${esc(st.message||'')}</div><div class="connection-actions"><button class="btn ghost" data-platform="${key}" data-connect-action="start" ${active?'disabled':''}>${st.state==='ok'?'重新登录':'连接账号'}</button><button class="btn ghost" data-platform="${key}" data-connect-action="validate" ${active?'disabled':''}>验证连接</button><button class="btn ghost" data-platform="${key}" data-connect-action="${active?'cancel':'disconnect'}">${active?'取消登录':'断开连接'}</button></div></section>`;}).join('');
+}
+$('connections').onclick=async e=>{
+  const b=e.target.closest('[data-connect-action]');if(!b)return;
+  const platform=b.dataset.platform,action=b.dataset.connectAction;
+  if(action==='disconnect'&&!confirm(`断开${PLATFORM_NAMES[platform]}并清除本地登录会话？监控列表和帖子会保留。`))return;
+  b.disabled=true;
+  try{const path='/api/connections/'+platform+(action==='disconnect'?'':'/'+action);const result=await api(path,{method:action==='disconnect'?'DELETE':'POST',body:'{}'});connections[platform]=result;renderConnections();if(action==='disconnect'){const key={weibo:'weibo_cookie',taoguba:'taoguba_cookie',zsxq:'zsxq_token',weread:'weread_cookie'}[platform];$(CREDENTIAL_IDS[key]).value='';$(CREDENTIAL_IDS[key]).placeholder='尚未配置';dirtySecrets.delete(key);}toast(result.message);}
+  catch(e){showError(e);}finally{b.disabled=false;}
+};
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));t.classList.add('active');currentPlatform=t.dataset.platform;loadPosts().catch(showError);});
+let searchTimer;$('searchBox').oninput=e=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{currentKeyword=e.target.value.trim();loadPosts().catch(showError);},350);};
+function applyTheme(t){document.documentElement.dataset.theme=t;localStorage.setItem('pm-theme',t);$('themeSelect').value=t;}
+$('themeSelect').onchange=e=>applyTheme(e.target.value);applyTheme(localStorage.getItem('pm-theme')||'dark');
+$('notifyButton').onclick=async()=>{if('Notification'in window)toast('通知权限：'+await Notification.requestPermission());};
+(async()=>{try{await loadProfiles();await loadPosts();await refreshStatus();connectStream();}catch(e){showError(e);}setInterval(()=>refreshStatus().catch(()=>{}),30000);setInterval(()=>{if(drawerOpen)refreshConnections().catch(()=>{});},2000);})();
