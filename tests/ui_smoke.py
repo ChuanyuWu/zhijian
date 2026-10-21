@@ -21,7 +21,7 @@ def main():
         update(users=[dict(platform='weibo',user_id='123',nickname='测试作者',avatar='https://wx1.sinaimg.cn/avatar.jpg',enabled=True),
                       dict(platform='taoguba',user_id='12489969',nickname='作手小五郎',avatar='https://image.tgb.cn/avatar.jpg',enabled=True)])
         post = dict(platform='weibo', author_id='123', author_name='旧昵称', post_id='5352161488930068',
-                    post_uid='weibo:123:5352161488930068', title='', content_html='摘要 <a href="https://weibo.com/status/5352161488930068">全文</a>',
+                    post_uid='weibo:123:5352161488930068', title='', content_html='摘要 <img src="https://face.t.sinajs.cn/expression/test.png" alt="[偷笑]"><img src="https://wx1.sinaimg.cn/broken.jpg"><a href="https://weibo.com/status/5352161488930068">全文</a>',
                     images=[], url='https://m.weibo.cn/detail/5352161488930068', published_at='2026-10-09T17:30:00+08:00', needs_fulltext=True)
         database.insert_post(post)
         server = subprocess.Popen([sys.executable, '-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', '18765', '--no-access-log'], cwd=ROOT,
@@ -43,7 +43,7 @@ def main():
                 page.on('pageerror', lambda e: errors.append(str(e)))
                 import base64
                 pixel=base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jxSkAAAAASUVORK5CYII=')
-                page.route('**/api/img?*',lambda route:route.fulfill(content_type='image/png',body=pixel))
+                page.route('**/api/img?*',lambda route:route.fulfill(status=404) if any(x in route.request.url for x in ('sinajs.cn','broken.jpg')) else route.fulfill(content_type='image/png',body=pixel))
                 connected={k:{'state':'ok' if k in ('weibo','weread') else 'public' if k=='taoguba' else 'pending','message':'状态说明'} for k in ('weibo','taoguba','zsxq','weread')}
                 page.route('**/api/connections',lambda route:route.fulfill(content_type='application/json',body=json.dumps(connected)))
                 def status_route(route):
@@ -57,13 +57,17 @@ def main():
                 url = page.url
                 def fail(route):route.fulfill(status=502, content_type='application/json', body=json.dumps({'detail':'全文暂时不可用'}))
                 page.route('**/api/posts/*/fulltext', fail)
-                page.locator('.card-body a').click()
+                assert page.locator('.card-body a').count()==0
+                assert page.locator('.card .expand-btn').count()==1
+                page.locator('.emoji-fallback').wait_for()
+                page.locator('.image-fallback').wait_for()
+                page.locator('.card .expand-btn').click()
                 page.get_by_text('全文暂时不可用', exact=False).wait_for()
                 assert page.url == url, 'fulltext must remain inside the app'
                 page.unroute('**/api/posts/*/fulltext', fail)
                 completed = dict(database.get_post(post['id']), content_html='这是已获取的完整微博正文。', needs_fulltext=False)
                 page.route('**/api/posts/*/fulltext', lambda route: route.fulfill(content_type='application/json',body=json.dumps({'post':completed})))
-                page.get_by_role('button',name='获取全文',exact=True).click()
+                page.get_by_role('button',name='展开全文 ▾',exact=True).click()
                 page.get_by_text('这是已获取的完整微博正文。',exact=True).wait_for()
                 assert page.locator('#statusBar').inner_text().find('12:34:56')>=0
                 page.locator('#pollCountdown').wait_for()
@@ -108,6 +112,15 @@ def main():
                 page.locator('.card').wait_for()
                 # New feed event: preserve keyword filtering and deduplicate durable IDs.
                 assert page.evaluate("matches({platform:'weibo',author_id:'123',content_html:'正文',title:'',author_name:''})")
+                prepared=dict(completed,content_html='完整正文。'*200,needs_fulltext=False)
+                page.evaluate('(post)=>applyPreparedPost(post)',prepared)
+                assert page.locator('.card .expand-btn').count()==1
+                assert page.locator('.collapsible.collapsed').count()==1
+                page.unroute('**/api/posts/*/fulltext')
+                requests=[]
+                page.on('request',lambda request:requests.append(request.url) if request.url.endswith('/fulltext') else None)
+                page.locator('.card .expand-btn').click()
+                assert page.locator('.collapsible.collapsed').count()==0 and not requests
                 page.get_by_role('button',name='⚙ 设置').click()
                 page.locator('.user-row').first.wait_for()
                 page.wait_for_timeout(350)

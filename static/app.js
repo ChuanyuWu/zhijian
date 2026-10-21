@@ -33,6 +33,11 @@ function avatarHtml(p,size) {
   return avatar ? `<img class="avatar" width="${size}" height="${size}" src="${pimg(avatar)}" alt="${esc(name[0])}">` : avatarPlaceholder(p.platform,name[0],size);
 }
 document.addEventListener('error',e=>{if(e.target.matches?.('img.avatar')){const span=document.createElement('span');span.className='avatar avatar-ph';span.textContent=e.target.alt||'?';span.style.width=(e.target.width||34)+'px';span.style.height=(e.target.height||34)+'px';e.target.replaceWith(span);}},true);
+document.addEventListener('error',e=>{
+  const img=e.target;if(!img.matches?.('.card-body img,.card-images img'))return;
+  const fallback=document.createElement('span');fallback.className=img.classList.contains('inline-emoji')?'emoji-fallback':'image-fallback';
+  fallback.textContent=img.classList.contains('inline-emoji')?(img.alt||'表情'):'图片暂不可用';fallback.title='可通过下方原文链接查看';img.replaceWith(fallback);
+},true);
 async function loadProfiles() {
   const cfg=await api('/api/settings'); userProfiles={};
   for(const u of cfg.users||[]) userProfiles[`${u.platform}:${u.user_id}`]={nickname:u.nickname,display_name:u.display_name,avatar:u.avatar};
@@ -52,13 +57,22 @@ function switchSettingsTab(tab){
   if(tab==='accounts')refreshConnections().catch(showError);
 }
 document.querySelector('.settings-tabs').onclick=e=>{const b=e.target.closest('[data-settings-tab]');if(b)switchSettingsTab(b.dataset.settingsTab);};
-function tidyHtml(html) {
+function tidyHtml(html,platform='') {
   const d=document.createElement('div'); d.innerHTML=html||'';
   // Defense in depth; the server applies the authoritative HTML whitelist.
   d.querySelectorAll('script,style,iframe,object,embed,form,svg,math').forEach(e=>e.remove());
   d.querySelectorAll('*').forEach(e=>{for(const a of [...e.attributes]) if(a.name.startsWith('on')||a.name==='style')e.removeAttribute(a.name);});
   d.querySelectorAll('a').forEach(a=>{if(!/^https?:\/\//i.test(a.getAttribute('href')||'')) a.removeAttribute('href');});
   d.querySelectorAll('div,font,span,p').forEach(e=>{if(!e.textContent.trim()&&!e.querySelector('img'))e.remove();});
+  if(platform==='weibo')d.querySelectorAll('a').forEach(a=>{if(a.textContent.includes('全文')&&/\/(status|detail)\//.test(a.getAttribute('href')||''))a.remove();});
+  d.querySelectorAll('img').forEach(img=>{
+    let src=img.getAttribute('src')||'';try{src=new URL(src,location.origin).searchParams.get('url')||src;}catch(e){}
+    if(/face\.t\.sinajs\.cn|\/expression\//i.test(src)||/^\[(?!图片|配图).+\]$/.test(img.alt)){
+      img.className='inline-emoji';img.alt=img.alt||'表情';img.title=img.alt;img.loading='lazy';
+    }else if(/timeline_card_small_/.test(src)){
+      const badge=document.createElement('span');badge.className='inline-resource';badge.textContent=/video/.test(src)?'视频':/location/.test(src)?'位置':'链接';img.replaceWith(badge);
+    }else{img.className='inline-picture';img.dataset.action='zoom';img.loading='lazy';img.alt=img.alt||'正文插图';}
+  });
   return d.innerHTML.replace(/(<br\s*\/?>\s*){3,}/gi,'<br><br>');
 }
 function imagesHtml(urls) {
@@ -66,9 +80,10 @@ function imagesHtml(urls) {
 }
 function cardHtml(p, expanded=false) {
   posts.set(Number(p.id),p);
-  const collapse=plainText(p.content_html).length>400 && !expanded;
+  const canExpand=p.needs_fulltext||plainText(p.content_html).length>400;
+  const collapse=canExpand&&!expanded;
   const count=(p.images||[]).length;
-  const content=tidyHtml(p.content_html);
+  const content=tidyHtml(p.content_html,p.platform);
   return `<article class="card" data-id="${Number(p.id)}">
     <div class="card-head">${avatarHtml(p,34)}<span class="badge ${esc(p.platform)}">${esc(PLATFORM_NAMES[p.platform]||p.platform)}</span>
     <span class="author" data-action="author" data-key="${esc(p.platform+':'+p.author_id)}">${esc(displayName(p))}</span>
@@ -76,20 +91,21 @@ function cardHtml(p, expanded=false) {
     ${p.title?`<div class="card-title">${esc(p.title)}</div>`:''}
     <div class="collapsible ${collapse?'collapsed':''}"><div class="card-body">${content||'（正文暂未抓取，可查看原文）'}</div><div class="fade"></div></div>
     <div class="img-slot">${collapse?'':imagesHtml(p.images||[])}</div>
-    ${plainText(p.content_html).length>400?`<button class="expand-btn" data-action="expand">${collapse?'展开已获取正文 ▾':'收起 ▴'}</button>`:''}
-    ${p.needs_fulltext?'<button class="expand-btn" data-action="fulltext">获取全文</button>':''}
+    ${canExpand?`<button class="expand-btn" data-action="expand">${collapse?'展开全文 ▾':'收起 ▴'}</button>`:''}
+    ${p.needs_fulltext?'<span class="preparing-note">全文后台准备中</span>':''}
     <div class="fulltext-error hint" role="status"></div>
     <div class="card-foot">${p.url?`<a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">查看原文 ↗</a>`:''}</div></article>`;
 }
 async function fetchFulltext(card) {
   if(card.dataset.loading==='1')return;
   card.dataset.loading='1'; const message=card.querySelector('.fulltext-error');
-  message.textContent='正在获取全文…';
+  const button=card.querySelector('.expand-btn');if(button){button.disabled=true;button.textContent='正在展开…';}
+  message.textContent='';
   try {
     const data=await api(`/api/posts/${card.dataset.id}/fulltext`,{method:'POST',body:'{}'});
     card.outerHTML=cardHtml(data.post,true);
-  } catch(e) { message.textContent=e.message+'。可以再次点击全文重试，或查看原文。'; }
-  finally { delete card.dataset.loading; }
+  } catch(e) { message.textContent=e.message+'。可稍后重试或查看原文。';const note=card.querySelector('.preparing-note');if(note)note.textContent='全文暂未补齐'; }
+  finally { delete card.dataset.loading;if(button?.isConnected){button.disabled=false;button.textContent='展开全文 ▾';} }
 }
 $('feed').addEventListener('click',async e=>{
   const card=e.target.closest('.card'); if(!card)return;
@@ -98,10 +114,10 @@ $('feed').addEventListener('click',async e=>{
   if(p?.platform==='weibo'&&a&&a.textContent.includes('全文')) {e.preventDefault();await fetchFulltext(card);return;}
   const target=e.target.closest('[data-action]'); if(!target)return;
   const action=target.dataset.action;
-  if(action==='fulltext')await fetchFulltext(card);
+  if(action==='expand'&&p.needs_fulltext){await fetchFulltext(card);return;}
   if(action==='expand') {
     const wrap=card.querySelector('.collapsible'); const collapsed=wrap.classList.toggle('collapsed');
-    target.textContent=collapsed?'展开已获取正文 ▾':'收起 ▴';
+    target.textContent=collapsed?'展开全文 ▾':'收起 ▴';
     if(!collapsed)card.querySelector('.img-slot').innerHTML=imagesHtml(p.images||[]);
   }
   if(action==='zoom')zoom(target.src);
@@ -134,9 +150,15 @@ async function loadPosts(offset=0,replace=true) {
 }
 function loadMore(){loadPosts(loadedCount,false).catch(showError);}
 function matches(p){return (!currentPlatform||p.platform===currentPlatform)&&(!currentAuthor||`${p.platform}:${p.author_id}`===currentAuthor)&&(!currentKeyword||[plainText(p.content_html),p.title,p.author_name].some(x=>(x||'').toLowerCase().includes(currentKeyword.toLowerCase())));}
+function applyPreparedPost(p){
+  const card=document.querySelector(`.card[data-id="${Number(p.id)}"]`);
+  if(card&&!card.dataset.loading){const expanded=!card.querySelector('.collapsible')?.classList.contains('collapsed');card.outerHTML=cardHtml(p,expanded);}
+  if(pendingNew.has(p.id))pendingNew.set(p.id,p);
+}
 function connectStream(){
   const es=new EventSource('/api/stream');
-  es.onmessage=ev=>{try{const p=JSON.parse(ev.data);if(matches(p)&&!posts.has(Number(p.id))&&!pendingNew.has(p.id)){pendingNew.set(p.id,p);$('newTip').style.display='block';$('newTip').querySelector('span').textContent=`有 ${pendingNew.size} 条新帖，点击刷新`;notify(p);}}catch(e){/* Ignore malformed event. */}};
+  es.addEventListener('post_updated',ev=>{try{applyPreparedPost(JSON.parse(ev.data));}catch(e){}});
+  es.onmessage=ev=>{try{const event=JSON.parse(ev.data);if(event.event==='post_updated'){applyPreparedPost(event.post);return;}const p=event;if(matches(p)&&!posts.has(Number(p.id))&&!pendingNew.has(p.id)){pendingNew.set(p.id,p);$('newTip').style.display='block';$('newTip').querySelector('span').textContent=`有 ${pendingNew.size} 条新帖，点击刷新`;notify(p);}}catch(e){/* Ignore malformed event. */}};
   // EventSource handles reconnection; no parallel manual reconnect loops.
 }
 $('newTip').onclick=()=>{loadPosts().catch(showError);window.scrollTo({top:0,behavior:'smooth'});};

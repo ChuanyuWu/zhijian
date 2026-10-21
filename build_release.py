@@ -38,7 +38,8 @@ def main():
     shutil.copy2(ROOT / 'dist' / 'zhijian_silent' / 'zhijian_silent.exe', release)
     for name in ('README.md', 'SHARING.md', 'exe_autostart_on.bat', 'exe_autostart_off.bat'):
         shutil.copy2(ROOT / name, release)
-    shutil.make_archive(str(ROOT / 'dist' / 'zhijian-windows'), 'zip', release.parent, release.name)
+    if '--no-archive' not in sys.argv:
+        shutil.make_archive(str(ROOT / 'dist' / 'zhijian-windows'), 'zip', release.parent, release.name)
     print('完成：dist/zhijian-windows.zip（不含个人 data）')
 
 if __name__ == '__main__':

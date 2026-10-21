@@ -334,3 +334,10 @@ button.danger { color:var(--danger); }
 .poll-status { margin-left:auto; font-size:11px; opacity:.85; }
 .avatar-ph { background:var(--bg-hover); color:var(--text-dim); }
 @media(max-width:540px){.settings-head,.settings-content,.settings-footer { padding-left:14px; padding-right:14px; }.settings-tabs { padding:0 12px; }.list-tools .hint { font-size:10px; }.poll-status { margin-left:0; }.status-bar { gap:8px; }.monitor-list { max-height:43vh; }}
+
+.card-body img.inline-emoji { display:inline-block; width:1.25em; height:1.25em; object-fit:contain; vertical-align:-.2em; margin:0 2px; }
+.card-body img.inline-picture { display:block; max-width:100%; max-height:440px; object-fit:contain; border-radius:8px; margin:12px 0; cursor:zoom-in; }
+.inline-resource,.image-fallback { display:inline-flex; align-items:center; gap:4px; padding:2px 7px; margin:0 3px; border:1px solid var(--border); border-radius:5px; color:var(--text-dim); font-size:.8em; background:var(--bg-hover); }
+.image-fallback::before { content:'▧'; }
+.emoji-fallback { color:var(--text-dim); font-size:.85em; margin:0 2px; }
+.preparing-note { font-size:11px; color:var(--text-dim); margin-left:10px; }

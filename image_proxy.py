@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from fastapi.responses import Response
 
 REFERERS = {'tgb.cn': 'https://www.tgb.cn/', 'sinaimg.cn': 'https://weibo.com/',
+            'sinajs.cn': 'https://weibo.com/',
             'sina.com.cn': 'https://weibo.com/', 'zsxq.com': 'https://wx.zsxq.com/',
             'qpic.cn': 'https://mp.weixin.qq.com/', 'qlogo.cn': 'https://weread.qq.com/',
             'weread.qq.com': 'https://weread.qq.com/', 'myqcloud.com': 'https://weread.qq.com/'}

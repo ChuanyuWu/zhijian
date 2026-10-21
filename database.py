@@ -158,3 +158,12 @@ def save_fulltext(post_id, post):
                   (post['content_html'], json.dumps(post.get('images', []), ensure_ascii=False),
                    post['url'], post_id))
     return get_post(post_id)
+
+
+def pending_fulltexts(author_id, limit=3):
+    """Only local summaries; caller applies request/cooldown limits."""
+    with _lock, _conn() as c:
+        return [r[0] for r in c.execute("""SELECT id FROM posts
+            WHERE platform='weibo' AND author_id=? AND fulltext_state!='ready'
+            AND (fulltext_state='pending' OR content_html LIKE '%全文%')
+            ORDER BY id DESC LIMIT ?""", (author_id, limit))]

@@ -32,6 +32,7 @@ def sanitize_html(raw, base='https://m.weibo.cn/'):
             node.set('rel', 'noopener noreferrer')
     for node in list(tree.iter('img')):
         src = node.get('src', '')
+        alt = node.get('alt', '')[:100]
         if src.startswith('/api/img?'):
             node.set('loading', 'lazy')
             continue
@@ -39,6 +40,8 @@ def sanitize_html(raw, base='https://m.weibo.cn/'):
         node.attrib.clear()
         if src:
             node.set('src', '/api/img?' + urlencode({'url': src}))
+            if alt:
+                node.set('alt', alt)
             node.set('loading', 'lazy')
         else:
             node.drop_tree()
@@ -59,4 +62,10 @@ def present_post(post):
     p['images'] = [url for url in (safe_url(x) for x in p.get('images', [])) if url]
     if p.get('platform') == 'weibo':
         p['needs_fulltext'] = bool(p.get('needs_fulltext')) or needs_fulltext(p['content_html'])
+        # Keep detection before removing upstream summary links from presentation.
+        tree = lh.fragment_fromstring(p['content_html'], create_parent='div')
+        for a in list(tree.iter('a')):
+            if '全文' in ''.join(a.itertext()) and re.search(r'/(?:status|detail)/', a.get('href', '')):
+                a.drop_tree()
+        p['content_html'] = lh.tostring(tree, encoding='unicode', method='html')[5:-6]
     return p

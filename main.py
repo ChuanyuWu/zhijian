@@ -19,7 +19,7 @@ from settings_schema import SettingsPatch, ResolveRequest, DiscoverRequest, norm
 from connections import KEYS
 from login_manager import manager
 from crawlers.base import AuthExpiredError, RateLimitedError
-from fulltext import complete_post
+from fulltext import complete_post, Prefetcher
 from image_proxy import fetch_image
 import monitor
 
@@ -33,11 +33,21 @@ def _token(pw):
 async def lifespan(app):
     init_db()
     task = None
+    prefetch_task = None
+    app.state.prefetch = None
     if os.environ.get('ZHIJIAN_DISABLE_MONITOR') != '1':
         task = asyncio.create_task(monitor.monitor_loop())
+        app.state.prefetch = Prefetcher()
+        prefetch_task = asyncio.create_task(app.state.prefetch.run())
     try:
         yield
     finally:
+        if prefetch_task:
+            prefetch_task.cancel()
+            try:
+                await prefetch_task
+            except asyncio.CancelledError:
+                pass
         if task:
             task.cancel()
             try:
@@ -127,11 +137,13 @@ async def index():
     return FileResponse(os.path.join(STATIC_DIR, 'index.html'))
 
 @app.get('/api/posts')
-def posts(platform: str = '', author: str = '', q: str = '', offset: int = 0, limit: int = 30):
+async def posts(platform: str = '', author: str = '', q: str = '', offset: int = 0, limit: int = 30):
     if limit < 1 or offset < 0:
         raise HTTPException(422, '分页参数无效')
-    return {'posts': query_posts(platform or None, author or None, q or None, offset, min(limit, 100)),
-            'total': count_posts()}
+    rows = await asyncio.to_thread(query_posts, platform or None, author or None, q or None, offset, min(limit, 100))
+    if app.state.prefetch:
+        app.state.prefetch.enqueue(rows)
+    return {'posts': rows, 'total': count_posts()}
 
 @app.delete('/api/posts/{post_id}')
 def remove_post(post_id: int):
@@ -164,7 +176,10 @@ async def stream():
             while True:
                 try:
                     p = await asyncio.wait_for(q.get(), 20)
-                    yield f'data: {json.dumps(p, ensure_ascii=False)}\n\n'
+                    if p.get('event') == 'post_updated':
+                        yield f'event: post_updated\ndata: {json.dumps(p["post"], ensure_ascii=False)}\n\n'
+                    else:
+                        yield f'data: {json.dumps(p, ensure_ascii=False)}\n\n'
                 except asyncio.TimeoutError:
                     yield ': keepalive\n\n'
         finally:

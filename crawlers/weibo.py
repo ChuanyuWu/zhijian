@@ -27,6 +27,7 @@ class WeiboCrawler(BaseCrawler):
     @staticmethod
     def _check_resp(r):
         if r.status_code in (403, 418, 429, 432):
+            WeiboCrawler._cooldown_until = time.monotonic() + 300
             raise RateLimitedError('微博请求受限，请稍后重试')
         if r.status_code == 401:
             raise AuthExpiredError('微博登录已失效，请重新连接')

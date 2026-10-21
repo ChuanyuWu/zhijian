@@ -115,6 +115,17 @@ def _run_one_user(platform, user, cfg):
                 except Exception:
                     pass  # Keep the summary; UI offers an explicit retry.
             new.append(present_post(record))
+    if platform == 'weibo' and budget:
+        # Repair older summaries as well; unchanged list entries used to be skipped forever.
+        from database import pending_fulltexts
+        from fulltext import complete_post
+        for row_id in pending_fulltexts(user['user_id'], budget):
+            try:
+                complete_post(row_id)
+            except (AuthExpiredError, RateLimitedError):
+                break
+            except Exception:
+                continue
     return new
 
 async def monitor_loop():
