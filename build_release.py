@@ -1,5 +1,7 @@
 """Build an offline-capable Windows folder with console and silent launchers."""
 import os
+import hashlib
+import re
 import shutil
 import subprocess
 import sys
@@ -7,10 +9,21 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
+def stamp_assets():
+    """Invalidate browser caches when an existing localhost installation upgrades."""
+    page = ROOT / 'static' / 'index.html'
+    html = page.read_text(encoding='utf-8')
+    for name in ('app.js', 'style.css'):
+        digest = hashlib.sha256((ROOT / 'static' / name).read_bytes()).hexdigest()[:12]
+        html = re.sub(r'/static/' + re.escape(name) + r'(?:\?v=[^"\s]+)?',
+                      '/static/' + name + '?v=' + digest, html)
+    page.write_text(html, encoding='utf-8')
+
 def main():
     if os.name != 'nt':
         raise SystemExit('请在 Windows 上打包')
     os.chdir(ROOT)
+    stamp_assets()
     browsers = ROOT / 'browsers'
     env = os.environ | {'PLAYWRIGHT_BROWSERS_PATH': str(browsers)}
     if not list(browsers.glob('chromium-*/chrome-win64/chrome.exe')):
