@@ -74,6 +74,9 @@
     <section data-settings-panel="preferences" hidden>
       <h3>阅读与提醒</h3><div class="field"><label for="themeSelect">界面主题（即时生效）</label><select id="themeSelect"><option value="dark">深色</option><option value="light">浅色</option></select></div>
       <button class="btn ghost" id="notifyButton">开启新帖浏览器通知</button>
+      <button class="btn ghost" id="testNotifyButton">发送测试通知</button>
+      <p class="hint" id="notificationStatus" role="status" aria-live="polite"></p>
+      <p class="hint">通知所有监控对象的新帖，不受当前列表筛选影响。网页必须保持打开；关闭网页后不会通知。如未弹出，请检查 Windows 通知及勿扰模式。</p>
       <h3>自动检查</h3><div class="field"><label for="interval">每轮结束后等待（秒，建议 60–300）</label><input id="interval" type="number" min="30" max="86400"></div><p class="hint">顶部显示最近检查时间和下一轮倒计时。对象越多，完成一轮所需时间越长。</p>
       <details><summary>本机访问密码</summary><div class="field"><input id="accessPassword" type="password" autocomplete="new-password" aria-label="本机访问密码" placeholder="留空保持不变；编辑后清空可关闭"></div></details>
     </section>
@@ -85,6 +88,6 @@
 
 <div class="toast" id="toast"></div>
 
-<script src="/static/app.js?v=550978eb432c"></script>
+<script src="/static/app.js?v=355a40317c7e"></script>
 </body>
 </html>

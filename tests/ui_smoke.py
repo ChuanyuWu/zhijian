@@ -39,6 +39,13 @@ def main():
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page(viewport={'width':1280, 'height':900})
+                page.add_init_script('''window.testNotifications=[];
+                  window.Notification=class {static permission='default';
+                    static async requestPermission(){this.permission='granted';return 'granted';}
+                    constructor(title,options){window.testNotifications.push({title,...options});}close(){} };
+                  window.EventSource=class {constructor(){window.testStream=this;this.listeners={};}
+                    addEventListener(name,fn){this.listeners[name]=fn;}close(){} };
+                ''')
                 errors=[]
                 page.on('pageerror', lambda e: errors.append(str(e)))
                 import base64
@@ -53,6 +60,13 @@ def main():
                 page.route('**/api/status',status_route)
                 page.goto('http://127.0.0.1:18765/')
                 page.locator('.card-body').wait_for()
+                page.evaluate("Notification.permission='granted'; currentKeyword='不匹配的筛选'; const event={id:987654,platform:'taoguba',author_id:'42',author_name:'通知测试',title:'新帖',content_html:'正文'};testStream.onmessage({data:JSON.stringify(event)});testStream.onmessage({data:JSON.stringify(event)});testStream.listeners.post_updated({data:JSON.stringify(event)});")
+                assert page.evaluate('testNotifications.length')==1,'filtered new post notifies once; fulltext updates stay silent'
+                assert page.locator('#newTip').is_hidden(),'filtered feed must stay unchanged'
+                page.evaluate("currentKeyword='';Notification.permission='denied';updateNotificationStatus()")
+                assert '阻止' in page.locator('#notificationStatus').text_content()
+                assert page.locator('#testNotifyButton').is_disabled()
+                page.evaluate("Notification.permission='default';updateNotificationStatus()")
                 assert page.locator('.author').inner_text()=='测试作者'
                 url = page.url
                 def fail(route):route.fulfill(status=502, content_type='application/json', body=json.dumps({'detail':'全文暂时不可用'}))
@@ -73,6 +87,13 @@ def main():
                 page.locator('#pollCountdown').wait_for()
                 assert '下轮' in page.locator('#pollCountdown').inner_text()
                 page.get_by_role('button',name='⚙ 设置').click()
+                page.get_by_role('button',name='偏好设置',exact=True).click()
+                page.locator('#notifyButton').click()
+                assert '已允许' in page.locator('#notificationStatus').inner_text()
+                page.locator('#testNotifyButton').click()
+                assert page.evaluate('testNotifications.length')==2
+                assert '已提交' in page.locator('#notificationStatus').inner_text()
+                page.get_by_role('button',name='监控对象',exact=True).click()
                 page.locator('.user-row').nth(1).wait_for()
                 assert page.locator('.user-row .avatar').count()==2
                 assert page.locator('.user-row').nth(1).inner_text().find('作手小五郎')>=0

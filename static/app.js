@@ -155,14 +155,41 @@ function applyPreparedPost(p){
   if(card&&!card.dataset.loading){const expanded=!card.querySelector('.collapsible')?.classList.contains('collapsed');card.outerHTML=cardHtml(p,expanded);}
   if(pendingNew.has(p.id))pendingNew.set(p.id,p);
 }
+const notifiedPosts=new Set();
+function handleNewPost(p){
+  const id=Number(p.id);if(!Number.isSafeInteger(id)||id<=0)return;
+  if(!posts.has(id)&&!notifiedPosts.has(id)){
+    notifiedPosts.add(id);if(notifiedPosts.size>2000)notifiedPosts.delete(notifiedPosts.values().next().value);
+    notify(p);
+  }
+  if(matches(p)&&!posts.has(id)&&!pendingNew.has(id)){
+    pendingNew.set(id,p);$('newTip').style.display='block';$('newTip').querySelector('span').textContent=`有 ${pendingNew.size} 条新帖，点击刷新`;
+  }
+}
 function connectStream(){
   const es=new EventSource('/api/stream');
   es.addEventListener('post_updated',ev=>{try{applyPreparedPost(JSON.parse(ev.data));}catch(e){}});
-  es.onmessage=ev=>{try{const event=JSON.parse(ev.data);if(event.event==='post_updated'){applyPreparedPost(event.post);return;}const p=event;if(matches(p)&&!posts.has(Number(p.id))&&!pendingNew.has(p.id)){pendingNew.set(p.id,p);$('newTip').style.display='block';$('newTip').querySelector('span').textContent=`有 ${pendingNew.size} 条新帖，点击刷新`;notify(p);}}catch(e){/* Ignore malformed event. */}};
+  es.onmessage=ev=>{try{const event=JSON.parse(ev.data);if(event.event==='post_updated'){applyPreparedPost(event.post);return;}handleNewPost(event);}catch(e){/* Ignore malformed event. */}};
   // EventSource handles reconnection; no parallel manual reconnect loops.
 }
 $('newTip').onclick=()=>{loadPosts().catch(showError);window.scrollTo({top:0,behavior:'smooth'});};
-function notify(p){if('Notification'in window&&Notification.permission==='granted')new Notification(`${PLATFORM_NAMES[p.platform]} · ${displayName(p)}`,{body:p.title||plainText(p.content_html).slice(0,80)});}
+function updateNotificationStatus(message=''){
+  const supported='Notification'in window&&window.isSecureContext;
+  const permission=supported?Notification.permission:'unsupported';
+  const labels={granted:'已允许浏览器通知；是否弹出还取决于 Windows 设置',denied:'通知已被阻止，请从地址栏的网站权限中改为允许',default:'尚未授权，请点击开启通知并选择允许',unsupported:'当前浏览器或地址不支持通知，请用 Edge 打开 http://127.0.0.1:8000'};
+  $('notificationStatus').textContent=message||labels[permission];
+  $('notifyButton').disabled=!supported||permission==='granted';
+  $('testNotifyButton').disabled=permission!=='granted';
+}
+function sendBrowserNotification(title,body,tag){
+  if(!('Notification'in window)||Notification.permission!=='granted')return false;
+  try{
+    const n=new Notification(title,{body,tag});
+    n.onerror=()=>updateNotificationStatus('浏览器未能显示通知，请检查 Windows 中该浏览器的通知权限及勿扰模式');
+    n.onclick=()=>{window.focus();n.close();};return true;
+  }catch(e){updateNotificationStatus('通知发送失败，请检查网站和 Windows 通知权限');return false;}
+}
+function notify(p){sendBrowserNotification(`${PLATFORM_NAMES[p.platform]} · ${displayName(p)}`,p.title||plainText(p.content_html).slice(0,80),'zhijian-post-'+p.id);}
 function updateCountdown(){
   const el=$('pollCountdown');if(!el||!scheduleState)return;
   const st=scheduleState;
@@ -284,5 +311,9 @@ document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{document.querySelect
 let searchTimer;$('searchBox').oninput=e=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{currentKeyword=e.target.value.trim();loadPosts().catch(showError);},350);};
 function applyTheme(t){document.documentElement.dataset.theme=t;localStorage.setItem('pm-theme',t);$('themeSelect').value=t;}
 $('themeSelect').onchange=e=>applyTheme(e.target.value);applyTheme(localStorage.getItem('pm-theme')||'dark');
-$('notifyButton').onclick=async()=>{if('Notification'in window)toast('通知权限：'+await Notification.requestPermission());};
+$('notifyButton').onclick=async()=>{try{if('Notification'in window)await Notification.requestPermission();updateNotificationStatus();}catch(e){updateNotificationStatus('无法请求通知权限，请检查地址栏的网站设置');}};
+$('testNotifyButton').onclick=()=>{if(sendBrowserNotification('知见 · 测试通知','看到此消息说明浏览器通知已送达。','zhijian-test'))updateNotificationStatus('测试通知已提交；请确认桌面或通知中心是否收到。未收到请检查 Windows 通知和勿扰模式');};
+window.addEventListener('focus',()=>updateNotificationStatus());
+if(navigator.permissions)navigator.permissions.query({name:'notifications'}).then(p=>{p.onchange=()=>updateNotificationStatus();}).catch(()=>{});
+updateNotificationStatus();
 (async()=>{try{await loadProfiles();await loadPosts();await refreshStatus();connectStream();}catch(e){showError(e);}setInterval(()=>refreshStatus().catch(()=>{}),5000);setInterval(()=>{if(drawerOpen)refreshConnections().catch(()=>{});},2000);})();

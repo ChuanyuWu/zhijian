@@ -9,6 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_core  # Shared isolated test DATA_DIR, set before application imports.
 import config
 from login_manager import LoginManager
+from browser_login import launch_login_context
+from unittest.mock import Mock
 
 class FakePipe:
     def __init__(self):self.messages=[]
@@ -36,6 +38,19 @@ class FakeContext:
 
 class LoginJobs(unittest.TestCase):
     def setUp(self):config.save_config(copy.deepcopy(config.DEFAULT_CONFIG))
+
+    def test_edge_preferred_and_bundled_fallback(self):
+        browser=Mock()
+        context,name=launch_login_context(browser,'isolated-profile')
+        self.assertEqual(name,'Edge')
+        self.assertEqual(browser.launch_persistent_context.call_args.kwargs['channel'],'msedge')
+        self.assertEqual(browser.launch_persistent_context.call_args.args[0],str(Path('isolated-profile')/'edge'))
+        browser=Mock()
+        browser.launch_persistent_context.side_effect=[RuntimeError('unavailable'),object()]
+        context,name=launch_login_context(browser,'isolated-profile')
+        self.assertEqual(name,'内置 Chromium')
+        self.assertNotIn('channel',browser.launch_persistent_context.call_args.kwargs)
+        self.assertEqual(browser.launch_persistent_context.call_args.args[0],'isolated-profile')
 
     def test_success_single_task_no_secret_and_newer_credential_wins(self):
         async def run():

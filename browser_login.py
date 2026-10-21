@@ -3,6 +3,19 @@ import os
 import time
 from pathlib import Path
 
+def launch_login_context(chromium, profile_path):
+    options = dict(headless=os.environ.get('ZHIJIAN_LOGIN_HEADLESS') == '1',
+                   args=['--no-default-browser-check'], accept_downloads=False,
+                   timeout=20000)
+    try:
+        # Keep Edge separate from the existing bundled Chromium profile.
+        context = chromium.launch_persistent_context(str(Path(profile_path) / 'edge'),
+                                                     channel='msedge', **options)
+        return context, 'Edge'
+    except Exception:
+        # Missing Edge or enterprise launch restrictions must not block login.
+        return chromium.launch_persistent_context(profile_path, **options), '内置 Chromium'
+
 def browser_worker(platform, profile_path, pipe, stop):
     from connections import LOGIN_URLS, COOKIE_URLS, credential_from_cookies, validate_credential
     import sys
@@ -16,13 +29,11 @@ def browser_worker(platform, profile_path, pipe, stop):
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(profile_path,
-                         headless=os.environ.get('ZHIJIAN_LOGIN_HEADLESS') == '1',
-                         args=['--no-default-browser-check'], accept_downloads=False)
+            context, browser_name = launch_login_context(p.chromium, profile_path)
             try:
                 page = context.pages[0] if context.pages else context.new_page()
                 page.goto(LOGIN_URLS[platform], wait_until='domcontentloaded', timeout=45000)
-                pipe.send({'state': 'waiting', 'message': '请在官方窗口完成登录；扫码需使用手机对应 App'})
+                pipe.send({'state': 'waiting', 'message': f'已使用{browser_name}打开官方窗口；请用手机对应 App 扫码或完成登录'})
                 deadline, last_credential, retry_at = time.monotonic() + 300, '', 0
                 while not stop.is_set() and time.monotonic() < deadline:
                     if not context.pages:
