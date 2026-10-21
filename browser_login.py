@@ -6,9 +6,13 @@ from pathlib import Path
 def browser_worker(platform, profile_path, pipe, stop):
     from connections import LOGIN_URLS, COOKIE_URLS, credential_from_cookies, validate_credential
     import sys
-    bundled = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'browsers'
-    if bundled.is_dir():
-        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(bundled)
+    root = Path(__file__).resolve().parent
+    candidates = [Path(getattr(sys, '_MEIPASS', root)) / 'browsers',
+                  root / '_internal' / 'browsers']
+    for bundled in candidates:
+        if bundled.is_dir():
+            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(bundled)
+            break
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
@@ -37,6 +41,8 @@ def browser_worker(platform, profile_path, pipe, stop):
                            'message': '登录已取消或超时，原凭据保留'})
             finally:
                 context.close()
+    except ModuleNotFoundError:
+        pipe.send({'state': 'error', 'message': '源码运行环境缺少浏览器依赖。请关闭程序，双击新版 zhijian_silent.exe；源码开发请先运行 install.bat'})
     except Exception:
         pipe.send({'state': 'error', 'message': '登录窗口无法继续；请检查浏览器组件，或使用手动凭据备用入口'})
     finally:

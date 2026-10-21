@@ -5,6 +5,11 @@ if errorlevel 1 exit /b 1
 .venv\Scripts\python.exe -m pip install -r requirements-lock.txt
 if errorlevel 1 exit /b 1
 set "PLAYWRIGHT_BROWSERS_PATH=%CD%\browsers"
+if exist "%CD%\_internal\browsers" (
+    echo Installed. Bundled browser components are available. Run start.bat.
+    pause
+    exit /b 0
+)
 .venv\Scripts\python.exe -m playwright install chromium
 if errorlevel 1 exit /b 1
 echo Installed. Run start.bat.
