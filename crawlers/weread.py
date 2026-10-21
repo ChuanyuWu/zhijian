@@ -61,18 +61,22 @@ class WereadCrawler(BaseCrawler):
         """续期并把新凭证写回 config。实测 {"ql": False} 才正确。"""
         try:
             r = client.post(f"{BASE}/web/login/renewal", json={"ql": False})
-            if '"succ"' not in r.text:
+            result = r.json()
+            if not isinstance(result, dict) or result.get('succ') not in (True, 1):
                 return
         except Exception:
             return
-        new = "; ".join(f"{k}={v}" for k, v in client.cookies.items())
+        values = {c.name: c.value for c in client.cookies.jar}
+        values.update({c.name: c.value for c in r.cookies.jar})
+        client.cookies.clear()
+        for key, value in values.items():
+            client.cookies.set(key, value, domain='.weread.qq.com')
+        new = "; ".join(f"{k}={v}" for k, v in values.items())
         if new and new != self.credential:
             try:
-                from config import load_config, save_config
-                cfg = load_config()
-                cfg["weread_cookie"] = new
-                save_config(cfg)
-                self.credential = new
+                from config import replace_credential
+                if replace_credential("weread_cookie", self.credential, new):
+                    self.credential = new
             except Exception:
                 pass
 
@@ -85,20 +89,39 @@ class WereadCrawler(BaseCrawler):
 
     @staticmethod
     def _parse_shelf(page: str) -> dict:
-        """从书架页 booksAndArchives 里抠公众号：ID -> {昵称, 头像, 链接, 更新戳}"""
+        """Read the embedded JSON state; tolerate field reordering and escaped titles."""
+        decoder = json.JSONDecoder()
+        states = []
+        for marker in re.finditer(r'(?:window\.)?__INITIAL_STATE__\s*=\s*', page):
+            try:
+                state, _ = decoder.raw_decode(page, marker.end())
+                states.append(state)
+            except ValueError:
+                continue
+        if not states:
+            # Safe fallback for server-rendered pages with no named initial-state variable.
+            for marker in re.finditer(r'\{\s*"bookId"\s*:', page):
+                try:
+                    state, _ = decoder.raw_decode(page, marker.start())
+                    states.append(state)
+                except ValueError:
+                    continue
         out = {}
-        pat = re.compile(
-            r'\{"bookId":"(MP_WXS_\w+)","deepLink":"([^"]*)","title":"([^"]*)"'
-            r'.*?"cover":"([^"]*)".*?"updateTime":(\d+),"lastChapterCreateTime":(\d+)',
-            re.S)
-        for m in pat.finditer(page):
-            bid, link, title, cover, upd, last = m.groups()
-            out[bid] = {
-                "nickname": title,
-                "avatar": _unesc(cover),
-                "link": _unesc(link),
-                "update_ts": int(last or upd or 0),
-            }
+        def visit(node):
+            if isinstance(node, list):
+                for item in node: visit(item)
+            elif isinstance(node, dict):
+                bid = node.get('bookId', '')
+                if isinstance(bid, str) and bid.startswith('MP_WXS_') and node.get('title'):
+                    stamp = node.get('lastChapterCreateTime') or node.get('updateTime') or 0
+                    try: stamp = int(stamp)
+                    except (ValueError, TypeError): stamp = 0
+                    out[bid] = {'nickname': node['title'], 'avatar': _unesc(node.get('cover','')),
+                                'link': _unesc(node.get('deepLink','')), 'reader_link': _unesc(node.get('readerLink','')),
+                                'update_ts': stamp}
+                for value in node.values():
+                    if isinstance(value, (dict,list)): visit(value)
+        for state in states: visit(state)
         return out
 
     # ---------- 设置页「同步书架」 ----------
@@ -154,6 +177,10 @@ class WereadCrawler(BaseCrawler):
                 m = re.search(r"[?&]v=([0-9a-zA-Z]+)", link)
                 if m:
                     url = f"{BASE}/web/mp/reader/{m.group(1)}"
+                else:
+                    reader = books.get(bid, {}).get('reader_link', '')
+                    if reader.startswith(BASE + '/web/mp/reader/'):
+                        url = reader
             except Exception:
                 pass
             # 全文（页面即微信文章 HTML，带 js_content 和 ct 时间戳）
@@ -207,3 +234,12 @@ class WereadCrawler(BaseCrawler):
         h = lh.tostring(n, encoding="unicode", method="html")
         h = h[h.find(">") + 1:h.rfind("</div>")]
         return h, images
+
+
+    def fetch_article_by_id(self, review_id):
+        with self._client() as c:
+            self._renew_and_persist(c)
+            r = c.get(f"{BASE}/web/mp/content", params={"reviewId": review_id})
+            r.raise_for_status()
+            content, images = self._parse_article_html(r.text)
+            return {"content_html": content, "images": images}

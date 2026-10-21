@@ -1,251 +1,317 @@
-"""FastAPI 入口：API + 静态页面 + SSE 实时推送 + 可选访问密码。"""
+"""Local-only FastAPI application. Browser login runs in a spawned helper."""
 import asyncio
 import hashlib
+import hmac
 import json
+import multiprocessing
 import os
 import secrets
 import sys
 from contextlib import asynccontextmanager
-
-import httpx
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
-                               StreamingResponse, FileResponse)
+from urllib.parse import urlparse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-
-from config import load_config, save_config, BASE_DIR
-from database import query_posts, count_posts, init_db
+from config import BASE_DIR, DATA_DIR, SECRET_KEYS, load_config, mutate_config
+from database import count_posts, delete_post, get_post, init_db, query_posts
+from settings_schema import SettingsPatch, ResolveRequest, DiscoverRequest, normalize_id
+from connections import KEYS
+from login_manager import manager
+from crawlers.base import AuthExpiredError, RateLimitedError
+from fulltext import complete_post, Prefetcher
+from image_proxy import fetch_image
 import monitor
 
+_session_key = secrets.token_bytes(32)
+_login_failures = {}
+
+def _token(pw):
+    return hmac.new(_session_key, pw.encode(), hashlib.sha256).hexdigest()
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app):
     init_db()
-    from repair import run_startup_repairs
-    run_startup_repairs()   # 启动自愈：修复历史数据，失败不影响启动
-    asyncio.create_task(monitor.monitor_loop())
-    yield
-
-
-app = FastAPI(title="知见", docs_url=None, redoc_url=None, lifespan=lifespan)
-
-STATIC_DIR = f"{BASE_DIR}/static"
-
-
-# ---------- 简易访问密码 ----------
-def _token(pw: str) -> str:
-    return hashlib.sha256(("post-monitor:" + pw).encode()).hexdigest()
-
-
-@app.middleware("http")
-async def auth_middleware(request: Request, call_next):
-    pw = load_config().get("access_password", "")
-    if not pw:
-        return await call_next(request)
-    path = request.url.path
-    if path.startswith("/static") or path in ("/login", "/api/login"):
-        return await call_next(request)
-    if request.cookies.get("pm_token") == _token(pw):
-        return await call_next(request)
-    if path.startswith("/api"):
-        return JSONResponse({"detail": "unauthorized"}, status_code=401)
-    return RedirectResponse("/login")
-
-
-@app.post("/api/login")
-async def api_login(request: Request):
-    body = await request.json()
-    pw = load_config().get("access_password", "")
-    if pw and body.get("password") == pw:
-        resp = JSONResponse({"ok": True})
-        resp.set_cookie("pm_token", _token(pw), max_age=30 * 86400, httponly=True)
-        return resp
-    raise HTTPException(401, "密码错误")
-
-
-@app.get("/login", response_class=HTMLResponse)
-async def login_page():
-    return FileResponse(f"{STATIC_DIR}/login.html")
-
-
-# ---------- 页面 ----------
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return FileResponse(f"{STATIC_DIR}/index.html")
-
-
-# ---------- 数据 API ----------
-@app.get("/api/posts")
-async def api_posts(platform: str = "", author: str = "", q: str = "",
-                    offset: int = 0, limit: int = 30):
-    posts = query_posts(
-        platform=platform or None,
-        author_id=author or None,
-        keyword=q or None,
-        offset=max(offset, 0),
-        limit=min(limit, 100),
-    )
-    return {"posts": posts, "total": count_posts()}
-
-
-@app.delete("/api/posts/{post_id}")
-async def api_delete_post(post_id: int):
-    from database import delete_post
-    if not delete_post(post_id):
-        raise HTTPException(404, "帖子不存在")
-    return {"ok": True}
-
-
-# ---------- 图片代理（绕开平台防盗链） ----------
-IMG_REFERERS = {
-    "tgb.cn": "https://www.tgb.cn/",
-    "sinaimg.cn": "https://weibo.com/",
-    "sina.com.cn": "https://weibo.com/",
-    "zsxq.com": "https://wx.zsxq.com/",
-    "qpic.cn": "https://mp.weixin.qq.com/",   # 微信公众号图片
-    "qlogo.cn": "https://weread.qq.com/",     # 微信头像/公众号头像
-    "weread.qq.com": "https://weread.qq.com/",
-    "myqcloud.com": "https://weread.qq.com/",
-}
-_IMG_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-           "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-
-
-@app.get("/api/img")
-async def proxy_img(url: str = ""):
-    from urllib.parse import urlparse
-    if not url.startswith("http"):
-        raise HTTPException(400, "bad url")
-    host = urlparse(url).netloc
-    referer = next((v for k, v in IMG_REFERERS.items() if k in host), None)
-    headers = {"User-Agent": _IMG_UA}
-    if referer:
-        headers["Referer"] = referer
+    task = None
+    prefetch_task = None
+    app.state.prefetch = None
+    if os.environ.get('ZHIJIAN_DISABLE_MONITOR') != '1':
+        task = asyncio.create_task(monitor.monitor_loop())
+        app.state.prefetch = Prefetcher()
+        prefetch_task = asyncio.create_task(app.state.prefetch.run())
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
-            r = await client.get(url, headers=headers)
-            # 知识星球防盗链：带错 Referer 会返回 ~2KB 水印图。
-            # 检测到水印就改用"裸请求"（不带任何 Referer）重试
-            if "zsxq.com" in host and len(r.content) < 20000:
-                r2 = await client.get(url, headers={"User-Agent": _IMG_UA})
-                if r2.status_code == 200 and len(r2.content) > len(r.content):
-                    r = r2
-        if r.status_code != 200:
-            raise HTTPException(502, f"upstream {r.status_code}")
-        return StreamingResponse(
-            iter([r.content]),
-            media_type=r.headers.get("content-type", "image/jpeg"),
-            headers={"Cache-Control": "public, max-age=86400"},
-        )
-    except httpx.HTTPError as e:
-        raise HTTPException(502, str(e))
+        yield
+    finally:
+        if prefetch_task:
+            prefetch_task.cancel()
+            try:
+                await prefetch_task
+            except asyncio.CancelledError:
+                pass
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await manager.close()
 
+app = FastAPI(title='知见', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+STATIC_DIR = os.path.join(BASE_DIR, 'static')
 
-@app.get("/api/stream")
-async def api_stream():
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request, exc):
+    return JSONResponse({'detail': '输入格式不正确，请检查 ID、平台和轮询间隔（30–86400 秒）'}, status_code=422)
+
+@app.middleware('http')
+async def local_guard(request: Request, call_next):
+    host = (request.url.hostname or '').lower()
+    if host not in ('127.0.0.1', 'localhost', '::1'):
+        return JSONResponse({'detail': '仅支持本机访问'}, status_code=403)
+    if request.url.path.startswith('/api/'):
+        origin = request.headers.get('origin')
+        if origin:
+            parsed = urlparse(origin)
+            if parsed.scheme not in ('http', 'https') or parsed.netloc != request.url.netloc:
+                return JSONResponse({'detail': '请求来源不匹配'}, status_code=403)
+        if request.headers.get('sec-fetch-site') == 'cross-site':
+            return JSONResponse({'detail': '拒绝跨站请求'}, status_code=403)
+        if request.method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            if request.headers.get('content-type', '').split(';')[0] != 'application/json':
+                return JSONResponse({'detail': '请使用 JSON 请求'}, status_code=415)
+            size = 0
+            chunks = []
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > 1024 * 1024:
+                    return JSONResponse({'detail': '请求过大'}, status_code=413)
+                chunks.append(chunk)
+            request._body = b''.join(chunks)
+    try:
+        pw = load_config().get('access_password', '')
+    except RuntimeError:
+        return JSONResponse({'detail': '配置无法读取，请恢复本地备份'}, status_code=503)
+    path = request.url.path
+    if pw and not (path.startswith('/static/') or path in ('/login', '/api/login')):
+        if not hmac.compare_digest(request.cookies.get('pm_token', ''), _token(pw)):
+            return JSONResponse({'detail': '请重新登录'}, status_code=401) if path.startswith('/api/') else RedirectResponse('/login')
+    response = await call_next(request)
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    if path.startswith('/api/') and path != '/api/img':
+        response.headers['Cache-Control'] = 'no-store'
+    return response
+
+@app.exception_handler(Exception)
+async def unexpected_error(request, exc):
+    # Never echo httpx exception URLs/headers or account credentials.
+    return JSONResponse({'detail': '操作失败，请重试或检查本地配置'}, status_code=500)
+
+@app.post('/api/login')
+async def api_login(request: Request):
+    import time
+    client = request.client.host if request.client else 'local'
+    failures = [t for t in _login_failures.get(client, []) if t > time.monotonic() - 60]
+    _login_failures[client] = failures
+    if len(failures) >= 10:
+        raise HTTPException(429, '请一分钟后重试')
+    body = await request.json()
+    pw = load_config().get('access_password', '')
+    supplied = body.get('password') if isinstance(body, dict) else None
+    if pw and isinstance(supplied, str) and hmac.compare_digest(supplied.encode(), pw.encode()):
+        _login_failures.pop(client, None)
+        response = JSONResponse({'ok': True})
+        response.set_cookie('pm_token', _token(pw), max_age=30*86400, httponly=True, samesite='strict')
+        return response
+    failures.append(time.monotonic())
+    raise HTTPException(401, '密码错误')
+
+@app.get('/login')
+async def login_page():
+    return FileResponse(os.path.join(STATIC_DIR, 'login.html'))
+
+@app.get('/')
+async def index():
+    return FileResponse(os.path.join(STATIC_DIR, 'index.html'))
+
+@app.get('/api/posts')
+async def posts(platform: str = '', author: str = '', q: str = '', offset: int = 0, limit: int = 30):
+    if limit < 1 or offset < 0:
+        raise HTTPException(422, '分页参数无效')
+    rows = await asyncio.to_thread(query_posts, platform or None, author or None, q or None, offset, min(limit, 100))
+    if app.state.prefetch:
+        app.state.prefetch.enqueue(rows)
+    return {'posts': rows, 'total': count_posts()}
+
+@app.delete('/api/posts/{post_id}')
+def remove_post(post_id: int):
+    if not delete_post(post_id):
+        raise HTTPException(404, '帖子不存在')
+    return {'ok': True}
+
+@app.post('/api/posts/{post_id}/fulltext')
+async def fulltext(post_id: int):
+    try:
+        return {'post': await asyncio.to_thread(complete_post, post_id)}
+    except LookupError:
+        raise HTTPException(404, '微博帖子不存在')
+    except AuthExpiredError:
+        raise HTTPException(401, '微博登录失效，请在设置中重新连接')
+    except RateLimitedError:
+        raise HTTPException(429, '微博请求受限，请五分钟后重试')
+    except Exception:
+        raise HTTPException(502, '暂时无法获取全文，帖子可能已删除、无权限或网络异常；摘要已保留')
+
+@app.get('/api/img')
+async def proxy_image(url: str = ''):
+    return await fetch_image(url)
+
+@app.get('/api/stream')
+async def stream():
     q = monitor.subscribe()
-
-    async def gen():
+    async def generate():
         try:
             while True:
-                post = await q.get()
-                yield f"data: {json.dumps(post, ensure_ascii=False)}\n\n"
-        except asyncio.CancelledError:
+                try:
+                    p = await asyncio.wait_for(q.get(), 20)
+                    if p.get('event') == 'post_updated':
+                        yield f'event: post_updated\ndata: {json.dumps(p["post"], ensure_ascii=False)}\n\n'
+                    else:
+                        yield f'data: {json.dumps(p, ensure_ascii=False)}\n\n'
+                except asyncio.TimeoutError:
+                    yield ': keepalive\n\n'
+        finally:
             monitor.unsubscribe(q)
+    return StreamingResponse(generate(), media_type='text/event-stream',
+                             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
-    return StreamingResponse(gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache",
-                                      "X-Accel-Buffering": "no"})
+@app.get('/api/status')
+def status():
+    return {'status': monitor.get_status(), 'total': count_posts(),
+            'scheduler': monitor.get_schedule()}
 
-
-@app.get("/api/status")
-async def api_status():
-    return {"status": monitor.get_status(), "total": count_posts()}
-
-
-# ---------- 设置 API ----------
-@app.get("/api/settings")
-async def get_settings():
+@app.get('/api/settings')
+def settings():
     cfg = load_config()
-    # 凭证打码回显（前端留空表示不修改）
-    masked = dict(cfg)
-    for k in ("weibo_cookie", "taoguba_cookie", "zsxq_token",
-              "weread_cookie", "access_password"):
-        v = cfg.get(k, "")
-        masked[k] = ("●" * 8) if v else ""
-    return masked
+    for key in SECRET_KEYS:
+        cfg[key] = '●' * 8 if cfg.get(key) else ''
+    return cfg
 
+@app.put('/api/settings')
+async def save_settings(body: SettingsPatch):
+    patch = {k: v for k, v in body.model_dump(exclude_unset=True).items()
+             if v is not None and not (k in SECRET_KEYS and v == '●' * 8)}
+    # A settings tab may stay open while the browser helper/renewal updates credentials.
+    # Untouched secrets are omitted by the UI, rather than copied from a stale snapshot.
+    mutate_config(lambda cfg: cfg.update(patch))
+    for platform, key in KEYS.items():
+        if key in patch:
+            manager.results.pop(platform, None)
+            job = manager.jobs.get(platform)
+            if job and job['public']['state'] not in ('starting', 'waiting'):
+                manager.jobs.pop(platform, None)
+    response = JSONResponse({'ok': True})
+    if patch.get('access_password'):
+        response.set_cookie('pm_token', _token(patch['access_password']), httponly=True, samesite='strict')
+    monitor.wake()
+    return response
 
-@app.put("/api/settings")
-async def put_settings(request: Request):
-    body = await request.json()
-    cfg = load_config()
-    for k in ("weibo_cookie", "taoguba_cookie", "zsxq_token",
-              "weread_cookie", "access_password", "poll_interval_sec"):
-        if k in body:
-            v = body[k]
-            if isinstance(v, str) and v == "●" * 8:
-                continue  # 未修改
-            cfg[k] = v
-    if "users" in body:
-        cfg["users"] = body["users"]
-    save_config(cfg)
-    return {"ok": True}
+def valid_platform(platform):
+    if platform not in KEYS:
+        raise HTTPException(404, '不支持的平台')
+    return platform
 
-
-@app.post("/api/users/resolve")
-async def resolve_user(request: Request):
-    """添加用户时自动补全昵称。"""
-    body = await request.json()
-    platform = body.get("platform", "")
-    uid = body.get("user_id", "").strip()
-    if platform not in monitor.CRAWLERS or not uid:
-        raise HTTPException(400, "参数不完整")
-    cls = monitor.CRAWLERS[platform]
-    if cls.needs_cookie and not load_config().get(monitor.CREDENTIAL_KEYS[platform], ""):
-        raise HTTPException(400, f"请先在下方填写{cls.display_name}的凭证再添加")
-    cred = load_config().get(monitor.CREDENTIAL_KEYS[platform], "")
+@app.post('/api/users/discover')
+async def discover_users(body: DiscoverRequest):
+    from discovery import discover
+    platform = valid_platform(body.platform)
     try:
-        profile = cls(cred).fetch_profile(uid)
-    except Exception as e:
-        raise HTTPException(400, f"获取用户信息失败：{e}")
-    out = {"nickname": profile.get("nickname", ""), "avatar": profile.get("avatar", "")}
-    if platform == "weread":
-        from crawlers.weread import extract_book_id
-        out["user_id"] = extract_book_id(uid)   # 用户可能粘的是整段网址
-    return out
+        return await asyncio.to_thread(discover, platform, body.query)
+    except AuthExpiredError:
+        raise HTTPException(400, '请先在平台账号页连接该平台')
+    except RateLimitedError:
+        raise HTTPException(429, '平台暂时限制查询，请稍后再试')
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except Exception:
+        raise HTTPException(502, '暂时未能查到对象，请检查平台连接，或改用主页链接')
 
+@app.get('/api/connections')
+async def connection_status():
+    return {platform: manager.public(platform) for platform in KEYS}
 
-# ---------- 公众号·微信读书书架同步 ----------
-@app.get("/api/weread/shelf")
-async def weread_shelf():
-    """枚举微信读书书架上订阅的公众号（设置页「同步书架」用）。"""
-    cred = load_config().get("weread_cookie", "")
-    if not cred:
-        raise HTTPException(400, "请先填写微信读书 Cookie 并保存")
+@app.post('/api/connections/{platform}/start')
+async def connection_start(platform: str):
+    return await manager.start(valid_platform(platform))
+
+@app.get('/api/connections/{platform}')
+async def connection_get(platform: str):
+    return manager.public(valid_platform(platform))
+
+@app.post('/api/connections/{platform}/cancel')
+async def connection_cancel(platform: str):
+    return await manager.cancel(valid_platform(platform))
+
+@app.post('/api/connections/{platform}/validate')
+async def connection_validate(platform: str):
+    return await manager.validate(valid_platform(platform))
+
+@app.delete('/api/connections/{platform}')
+async def connection_delete(platform: str):
+    result = await manager.disconnect(valid_platform(platform))
+    monitor.wake()
+    return result
+
+@app.post('/api/users/resolve')
+async def resolve(body: ResolveRequest):
+    platform = valid_platform(body.platform)
+    try:
+        uid = normalize_id(platform, body.user_id)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    credential = load_config().get(KEYS[platform], '')
+    if monitor.CRAWLERS[platform].needs_cookie and not credential:
+        raise HTTPException(400, '请先连接该平台，再添加监控对象')
+    try:
+        profile = await asyncio.to_thread(monitor.CRAWLERS[platform](credential).fetch_profile, uid)
+        if not profile.get('nickname'):
+            raise RuntimeError()
+        return dict(profile, user_id=uid)
+    except Exception:
+        raise HTTPException(502, '未能读取资料，请检查连接和 ID；也可选择仍然添加')
+
+@app.get('/api/weread/shelf')
+async def shelf():
     from crawlers.weread import WereadCrawler
+    credential = load_config().get('weread_cookie', '')
+    if not credential:
+        raise HTTPException(400, '请先连接微信读书')
     try:
-        accounts = await asyncio.to_thread(WereadCrawler(cred).list_shelf_accounts)
-    except Exception as e:
-        raise HTTPException(400, str(e))
-    return {"accounts": accounts}
+        return {'accounts': await asyncio.to_thread(WereadCrawler(credential).list_shelf_accounts)}
+    except Exception:
+        raise HTTPException(502, '书架读取失败，请验证微信读书连接')
 
+app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-if __name__ == "__main__":
-    if getattr(sys, "frozen", False):
-        # exe 形态（尤其无窗口版）：没有控制台，把所有输出/报错写入日志文件
-        from config import DATA_DIR
+def run():
+    if getattr(sys, 'frozen', False):
         os.makedirs(DATA_DIR, exist_ok=True)
-        logf = open(os.path.join(DATA_DIR, "run.log"), "a",
-                    encoding="utf-8", buffering=1)
-        sys.stdout = logf
-        sys.stderr = logf
-        import logging
-        logging.basicConfig(stream=logf, level=logging.INFO,
-                            format="%(asctime)s %(levelname)s %(message)s")
-        sys.excepthook = lambda t, v, tb: logging.error(
-            "uncaught exception", exc_info=(t, v, tb))
+        log = open(os.path.join(DATA_DIR, 'run.log'), 'a', encoding='utf-8', buffering=1)
+        sys.stdout = sys.stderr = log
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
+    import webbrowser
+    import threading
+    from instance_lock import acquire_instance
+    port = int(os.environ.get('ZHIJIAN_PORT', '8000'))
+    if not acquire_instance():
+        webbrowser.open(f'http://127.0.0.1:{port}')
+        return
+    if os.environ.get('ZHIJIAN_NO_BROWSER') != '1':
+        threading.Timer(1.5, lambda: webbrowser.open(f'http://127.0.0.1:{port}')).start()
+    uvicorn.run(app, host='127.0.0.1', port=port, log_level='warning', access_log=False)
+
+if __name__ == '__main__':
+    multiprocessing.freeze_support()
+    run()

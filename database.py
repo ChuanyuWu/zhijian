@@ -2,6 +2,7 @@
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 
 from config import DB_PATH, DATA_DIR
@@ -11,10 +12,15 @@ _lock = threading.Lock()
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
+@contextmanager
 def _conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -34,6 +40,9 @@ def init_db():
             published_at TEXT DEFAULT '',    -- ISO 时间
             created_at TEXT DEFAULT ''       -- 入库时间
         )""")
+        columns = {r[1] for r in c.execute("PRAGMA table_info(posts)")}
+        if "fulltext_state" not in columns:
+            c.execute("ALTER TABLE posts ADD COLUMN fulltext_state TEXT DEFAULT 'unknown'")
         c.execute("CREATE INDEX IF NOT EXISTS idx_posts_time ON posts(published_at DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_posts_platform ON posts(platform)")
         c.commit()
@@ -53,8 +62,12 @@ def insert_post(p: dict) -> bool:
             p.get("url", ""), p.get("published_at", ""),
             datetime.now().isoformat(timespec="seconds"),
         ))
-        c.commit()
-        return cur.rowcount > 0
+        if cur.rowcount > 0:
+            c.execute("UPDATE posts SET fulltext_state=? WHERE id=?",
+                      ("pending" if p.get("needs_fulltext") else "ready", cur.lastrowid))
+            p["id"] = cur.lastrowid
+            return True
+        return False
 
 
 def query_posts(platform=None, author_id=None, keyword=None, offset=0, limit=50):
@@ -76,7 +89,10 @@ def query_posts(platform=None, author_id=None, keyword=None, offset=0, limit=50)
         rows = [dict(r) for r in c.execute(sql, args).fetchall()]
     for r in rows:
         r["images"] = json.loads(r["images"] or "[]")
-    return rows
+    from content_safety import present_post
+    for r in rows:
+        r['needs_fulltext'] = r.get('fulltext_state') == 'pending'
+    return [present_post(r) for r in rows]
 
 
 def count_posts():
@@ -122,3 +138,32 @@ def distinct_authors():
         return [dict(r) for r in c.execute(
             "SELECT DISTINCT platform, author_id, author_name FROM posts ORDER BY platform"
         ).fetchall()]
+
+
+def get_post(post_id):
+    with _lock, _conn() as c:
+        row = c.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
+    if not row:
+        return None
+    p = dict(row)
+    p['images'] = json.loads(p['images'] or '[]')
+    p['needs_fulltext'] = p.get('fulltext_state') == 'pending'
+    from content_safety import present_post
+    return present_post(p)
+
+
+def save_fulltext(post_id, post):
+    with _lock, _conn() as c:
+        c.execute("UPDATE posts SET content_html=?, images=?, url=?, fulltext_state='ready' WHERE id=?",
+                  (post['content_html'], json.dumps(post.get('images', []), ensure_ascii=False),
+                   post['url'], post_id))
+    return get_post(post_id)
+
+
+def pending_fulltexts(author_id, limit=3):
+    """Only local summaries; caller applies request/cooldown limits."""
+    with _lock, _conn() as c:
+        return [r[0] for r in c.execute("""SELECT id FROM posts
+            WHERE platform='weibo' AND author_id=? AND fulltext_state!='ready'
+            AND (fulltext_state='pending' OR content_html LIKE '%全文%')
+            ORDER BY id DESC LIMIT ?""", (author_id, limit))]

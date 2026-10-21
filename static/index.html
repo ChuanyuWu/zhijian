@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>知见</title>
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=5fc00787f29a">
 </head>
 <body>
 
@@ -35,87 +35,59 @@
 <button class="load-more" id="loadMore" style="display:none" onclick="loadMore()">加载更早的帖子</button>
 
 <div class="drawer-mask" id="drawerMask" onclick="closeSettings()"></div>
-<div class="drawer" id="drawer">
-  <h2>⚙ 设置</h2>
-
-  <h3>监控用户</h3>
-  <div id="userList"></div>
-  <div style="display:flex;gap:8px;margin-bottom:10px">
-    <button class="btn ghost" style="flex:1" onclick="exportUsers()">⤓ 导出列表</button>
-    <button class="btn ghost" style="flex:1" onclick="document.getElementById('importFile').click()">⤒ 导入列表</button>
-    <input type="file" id="importFile" accept=".json" style="display:none" onchange="importUsers(this)">
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="设置">
+  <header class="settings-head"><div><h2>设置</h2><span class="hint">管理关注的人与平台连接</span></div><button class="icon-btn" onclick="closeSettings()" aria-label="关闭设置">✕</button></header>
+  <nav class="settings-tabs" aria-label="设置分类">
+    <button class="active" data-settings-tab="monitors">监控对象</button>
+    <button data-settings-tab="accounts">平台账号</button>
+    <button data-settings-tab="preferences">偏好设置</button>
+  </nav>
+  <div class="settings-content">
+    <section data-settings-panel="monitors">
+      <div class="section-heading"><h3>我的监控 <span id="userCount"></span></h3><button class="btn small" id="openAdd">＋ 添加</button></div>
+      <input class="settings-search" id="userSearch" placeholder="筛选昵称或平台…" aria-label="筛选监控对象">
+      <div id="userList" class="monitor-list"></div>
+      <div class="list-tools"><button class="text-btn" onclick="exportUsers()">导出列表</button><button class="text-btn" onclick="document.getElementById('importFile').click()">导入列表</button><span class="hint">列表修改后需保存</span><input type="file" id="importFile" accept=".json" hidden onchange="importUsers(this)"></div>
+      <details id="addMonitor" class="add-monitor">
+        <summary>添加监控对象</summary>
+        <div class="add-row"><select id="newPlatform" aria-label="对象平台"><option value="weibo">微博</option><option value="taoguba">淘股吧</option><option value="zsxq">知识星球</option><option value="weread">公众号</option></select><input id="newUid" placeholder="搜索昵称，或粘贴主页链接" aria-label="搜索对象"><button class="btn small" id="discoverButton">查找</button></div>
+        <p id="discoveryHint" class="hint"></p>
+        <div class="discovery-toolbar"><button class="text-btn" id="browseTargets">从已加入的列表选择</button><a id="openPlatform" target="_blank" rel="noopener noreferrer">打开平台 ↗</a></div>
+        <div id="candidateResults" aria-live="polite"></div>
+        <details class="advanced-add"><summary>高级：使用 ID 添加</summary><p class="hint">仍支持数字 UID、星球ID:用户ID 和 MP_WXS_ ID。填入上方输入框查找；接口异常时也可手动添加。</p><button class="text-btn" onclick="addUser()">按 ID 手动添加</button></details>
+      </details>
+      <details class="status-details"><summary>查看各对象抓取状态</summary><div class="hint" id="userStatus"></div></details>
+    </section>
+    <section data-settings-panel="accounts" hidden>
+      <div class="section-heading"><h3>平台账号</h3><span class="hint">连接操作即时生效</span></div>
+      <p class="hint connection-intro">首次点击连接，在官方窗口登录。二维码用手机对应 App 扫描；失效后可重新登录。</p>
+      <div id="connections"><p class="hint">正在读取连接状态…</p></div>
+      <details class="manual-credentials"><summary>手动凭据备用入口</summary>
+        <p class="hint">通常无需填写。输入后保存，再验证连接；未编辑的输入保持原值。</p>
+        <div class="field"><label>微博 Cookie</label><input id="weiboCookie" type="password" autocomplete="off"></div>
+        <div class="field"><label>淘股吧 Cookie（可选）</label><input id="taogubaCookie" type="password" autocomplete="off"></div>
+        <div class="field"><label>知识星球 zsxq_access_token</label><input id="zsxqToken" type="password" autocomplete="off"></div>
+        <div class="field"><label>微信读书 Cookie</label><input id="wereadCookie" type="password" autocomplete="off"></div>
+      </details>
+      <p class="hint privacy-note">凭据和会话只保存在本机。分享程序请排除 data 目录。</p>
+    </section>
+    <section data-settings-panel="preferences" hidden>
+      <h3>阅读与提醒</h3><div class="field"><label for="themeSelect">界面主题（即时生效）</label><select id="themeSelect"><option value="dark">深色</option><option value="light">浅色</option></select></div>
+      <button class="btn ghost" id="notifyButton">开启新帖浏览器通知</button>
+      <button class="btn ghost" id="testNotifyButton">发送测试通知</button>
+      <p class="hint" id="notificationStatus" role="status" aria-live="polite"></p>
+      <p class="hint">通知所有监控对象的新帖，不受当前列表筛选影响。网页必须保持打开；关闭网页后不会通知。如未弹出，请检查 Windows 通知及勿扰模式。</p>
+      <h3>自动检查</h3><div class="field"><label for="interval">每轮结束后等待（秒，建议 60–300）</label><input id="interval" type="number" min="30" max="86400"></div><p class="hint">顶部显示最近检查时间和下一轮倒计时。对象越多，完成一轮所需时间越长。</p>
+      <details><summary>本机访问密码</summary><div class="field"><input id="accessPassword" type="password" autocomplete="new-password" aria-label="本机访问密码" placeholder="留空保持不变；编辑后清空可关闭"></div></details>
+    </section>
   </div>
-  <div class="add-row">
-    <select id="newPlatform">
-      <option value="weibo">微博</option>
-      <option value="taoguba">淘股吧</option>
-      <option value="zsxq">知识星球</option>
-      <option value="weread">公众号</option>
-    </select>
-    <input id="newUid" placeholder="用户 ID（微博数字 uid / 淘股吧 blog 数字）">
-    <button class="btn ghost" onclick="addUser()">＋</button>
-  </div>
-  <div class="hint">
-    微博 ID：打开 m.weibo.cn/u/xxxxx，xxxx 即 uid。<br>
-    淘股吧 ID：打开用户主页 tgb.cn/blog/xxxxx，xxxx 即 ID。<br>
-    知识星球：填「星球ID」监控整个星球；填「星球ID:用户ID」监控星球里某个人。
-    星球 ID 在星球主页网址里（wx.zsxq.com/dweb2/index/group/数字）。<br>
-    公众号：手机微信读书 App 订阅该公众号后，点下方「同步书架」勾选添加（推荐）；也可直接填 MP_WXS_ 开头的 ID。
-  </div>
-
-  <h3>平台凭证</h3>
-  <div class="field">
-    <label>微博 Cookie（必须，含 SUB= 字段；●●● 表示已保存未修改）</label>
-    <input id="weiboCookie" placeholder="粘贴整条 Cookie">
-  </div>
-  <div class="field">
-    <label>淘股吧 Cookie（可选，公开内容不登录也能抓）</label>
-    <input id="taogubaCookie" placeholder="可留空">
-  </div>
-  <div class="field">
-    <label>知识星球 Token（zsxq_access_token，网页版 F12 获取）</label>
-    <input id="zsxqToken" placeholder="粘贴 zsxq_access_token 的值">
-  </div>
-  <div class="field">
-    <label>微信读书 Cookie·公众号（weread.qq.com 网页版 F12 获取；程序会自动续期）</label>
-    <input id="wereadCookie" placeholder="wr_vid=…; wr_skey=…; wr_rt=…; wr_fp=…">
-  </div>
-  <div class="field">
-    <label>书架上的公众号（先在手机 App 里订阅，再点同步）</label>
-    <button class="btn ghost" onclick="syncShelf()">🔄 同步书架</button>
-    <div id="shelfList" style="margin-top:8px"></div>
-  </div>
-
-  <h3>外观</h3>
-  <div class="field">
-    <label>主题（选择后立即生效并记住）</label>
-    <select id="themeSelect">
-      <option value="dark">深色</option>
-      <option value="light">浅色</option>
-    </select>
-  </div>
-
-  <h3>轮询与访问</h3>
-  <div class="field">
-    <label>轮询间隔（秒，建议 60~300）</label>
-    <input id="interval" type="number" min="30">
-  </div>
-  <div class="field">
-    <label>访问密码（留空 = 不需要密码；部署到公网务必设置）</label>
-    <input id="accessPassword" placeholder="留空则不启用">
-  </div>
-
-  <div class="btn-row">
-    <button class="btn" onclick="saveSettings()">保存</button>
-    <button class="btn ghost" onclick="closeSettings()">取消</button>
-  </div>
-  <div class="hint">凭证只保存在本程序所在目录的 data/config.json，不会上传任何地方。</div>
-</div>
+  <footer class="settings-footer"><span id="settingsDirty" class="hint">修改列表或偏好后保存</span><button class="btn" onclick="saveSettings()">保存更改</button></footer>
+</aside>
 
 <div class="lightbox" id="lightbox"><img src=""></div>
 
 <div class="toast" id="toast"></div>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=355a40317c7e"></script>
 </body>
 </html>

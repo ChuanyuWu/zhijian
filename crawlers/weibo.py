@@ -1,152 +1,145 @@
-"""微博爬虫：m.weibo.cn 移动端 API + Cookie。
-
-接口流程：
-1. GET /api/container/getIndex?type=uid&value={uid}  -> 找到 "微博" tab 的 containerid
-2. GET /api/container/getIndex?type=uid&value={uid}&containerid={cid}&page=1
-   -> data.cards[] 中 card_type==9 的 mblog 即帖子
-
-注意：
-- 必须带含 SUB= 的登录 Cookie，否则返回 ok=-100 / Sina Visitor System
-- 风控对频率敏感，monitor 已做间隔控制；仍建议用小号 Cookie
-"""
+"""Mobile Weibo list, detail and long text; never rewrite mobile paths to desktop."""
+import html
 import re
+import threading
+import time
 from datetime import datetime
-
 import httpx
-from lxml import html as lh
-
+from content_safety import sanitize_html, needs_fulltext
 from .base import BaseCrawler, AuthExpiredError, RateLimitedError
 
-UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
-
-API = "https://m.weibo.cn/api/container/getIndex"
-
+UA = ('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
+      'AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1')
+API = 'https://m.weibo.cn/api/container/getIndex'
 
 class WeiboCrawler(BaseCrawler):
-    platform = "weibo"
-    display_name = "微博"
+    platform = 'weibo'
+    display_name = '微博'
     needs_cookie = True
+    _cooldown_until = 0
+    _cooldown_lock = threading.Lock()
 
-    def _client(self) -> httpx.Client:
-        return httpx.Client(
-            headers={
-                "User-Agent": UA,
-                "Referer": "https://m.weibo.cn/",
-                "Cookie": self.credential,
-                "X-Requested-With": "XMLHttpRequest",
-            },
-            timeout=15,
-            follow_redirects=True,
-        )
+    def _client(self):
+        return httpx.Client(headers={'User-Agent': UA, 'Referer': 'https://m.weibo.cn/',
+                                     'Cookie': self.credential, 'X-Requested-With': 'XMLHttpRequest'},
+                            timeout=15, follow_redirects=True)
 
     @staticmethod
-    def _check_resp(r: httpx.Response):
-        if r.status_code == 432:
-            raise RateLimitedError("微博返回 432，被限流，稍后自动重试")
+    def _check_resp(r):
+        if r.status_code in (403, 418, 429, 432):
+            WeiboCrawler._cooldown_until = time.monotonic() + 300
+            raise RateLimitedError('微博请求受限，请稍后重试')
+        if r.status_code == 401:
+            raise AuthExpiredError('微博登录已失效，请重新连接')
         if r.status_code != 200:
-            raise RuntimeError(f"微博接口 HTTP {r.status_code}")
-        ct = r.headers.get("content-type", "")
-        if "json" not in ct:
-            # 被导到 Sina Visitor System 登录页 = Cookie 失效
-            raise AuthExpiredError("微博 Cookie 失效，请更新")
+            raise RuntimeError('微博接口暂时不可用')
+        if 'json' not in r.headers.get('content-type', ''):
+            raise AuthExpiredError('微博未返回登录后的数据，请验证连接')
         data = r.json()
-        if data.get("ok") == -100:
-            raise AuthExpiredError("微博 Cookie 失效（ok=-100），请更新")
+        if data.get('ok') == -100:
+            raise AuthExpiredError('微博登录已失效，请重新连接')
+        if data.get('ok') == 0:
+            raise RuntimeError('微博不存在、无权访问，或接口暂时不可用')
         return data
 
-    def _get_container_id(self, client: httpx.Client, uid: str) -> tuple[str, str, dict]:
-        data = self._check_resp(client.get(API, params={"type": "uid", "value": uid}))
-        d = data.get("data") or {}
-        info = d.get("userInfo") or {}
-        name = info.get("screen_name", "")
-        for tab in (d.get("tabsInfo") or {}).get("tabs", []):
-            if tab.get("tab_type") == "weibo":
-                return tab["containerid"], name, info
-        raise RuntimeError("未找到微博 tab（该用户可能没有公开微博）")
+    def _get_container_id(self, client, uid):
+        data = self._check_resp(client.get(API, params={'type': 'uid', 'value': uid}))
+        d = data.get('data') or {}
+        info = d.get('userInfo') or {}
+        for tab in (d.get('tabsInfo') or {}).get('tabs', []):
+            if tab.get('tab_type') == 'weibo':
+                return tab['containerid'], info.get('screen_name', ''), info
+        raise RuntimeError('未找到该用户的微博列表')
 
-    def fetch_user_name(self, user_id: str) -> str:
-        with self._client() as c:
-            _, name, _ = self._get_container_id(c, user_id)
-            return name
-
-    def fetch_profile(self, user_id: str) -> dict:
+    def fetch_profile(self, user_id):
         with self._client() as c:
             _, name, info = self._get_container_id(c, user_id)
-            return {"nickname": name, "avatar": info.get("profile_image_url", "")}
+            return {'nickname': name, 'avatar': info.get('profile_image_url', '')}
+
+    def fetch_user_name(self, user_id):
+        return self.fetch_profile(user_id)['nickname']
 
     @staticmethod
-    def _clean_html(raw: str) -> str:
-        """清洗微博正文 HTML：
-        - 相对链接（/status/xxx 等）改写为 weibo.com 绝对地址
-        - 所有链接强制新标签页打开（否则会跳到我们自己域名上 404）
-        - 移除脚本/样式
-        """
-        tree = lh.fromstring(f"<div>{raw}</div>")
-        for bad in tree.xpath(".//script | .//style"):
-            bad.getparent().remove(bad)
-        for a in tree.iter("a"):
-            href = a.get("href", "")
-            if href.startswith("//"):
-                a.set("href", "https:" + href)
-            elif href.startswith("/"):
-                a.set("href", "https://weibo.com" + href)
-            a.set("target", "_blank")
-            a.set("rel", "noopener")
-        content = lh.tostring(tree, encoding="unicode", method="html")
-        return content[5:-6]  # 去掉外包 div
+    def _clean_html(raw):
+        return sanitize_html(raw, 'https://m.weibo.cn/')
 
     @staticmethod
-    def _parse_mblog(mb: dict) -> dict:
-        bid = mb.get("bid") or str(mb.get("id"))
-        content = WeiboCrawler._clean_html(mb.get("text", ""))
+    def _is_long(mb):
+        return bool(mb.get('isLongText')) or needs_fulltext(mb.get('text', ''))
 
+    @staticmethod
+    def _parse_mblog(mb):
+        content = WeiboCrawler._clean_html(mb.get('text', ''))
         images = []
-        for pic in mb.get("pics") or []:
-            large = (pic.get("large") or {}).get("url") or pic.get("url")
-            if large:
-                images.append(large)
-
-        # 转发微博：拼接原文
-        rt = mb.get("retweeted_status")
-        if rt and rt.get("text"):
-            rt_user = (rt.get("user") or {}).get("screen_name", "原博主")
-            rt_text = re.sub(r"<[^>]+>", "", rt["text"])
-            content += f'<div class="retweet">🔁 @{rt_user}：{rt_text}</div>'
-            for pic in rt.get("pics") or []:
-                large = (pic.get("large") or {}).get("url") or pic.get("url")
-                if large:
-                    images.append(large)
-
-        # 时间："Tue Jul 21 08:26:00 +0800 2026"
-        ts = mb.get("created_at", "")
+        def pictures(node):
+            for pic in node.get('pics') or []:
+                src = (pic.get('large') or {}).get('url') or pic.get('url')
+                if src and src not in images:
+                    images.append(src)
+        pictures(mb)
+        rt = mb.get('retweeted_status') or {}
+        if rt:
+            name = html.escape((rt.get('user') or {}).get('screen_name', '原博主'))
+            content += f'<div class="retweet">🔁 @{name}：{WeiboCrawler._clean_html(rt.get("text", "原微博已不可用"))}</div>'
+            pictures(rt)
         try:
-            dt = datetime.strptime(ts, "%a %b %d %H:%M:%S %z %Y")
-            published = dt.isoformat(timespec="seconds")
+            published = datetime.strptime(mb.get('created_at', ''), '%a %b %d %H:%M:%S %z %Y').isoformat(timespec='seconds')
         except (ValueError, TypeError):
-            published = ts
+            published = mb.get('created_at', '')
+        pid = str(mb.get('id', ''))
+        if not pid.isdigit():
+            raise ValueError('微博缺少 ID')
+        return dict(post_id=pid, author_name=(mb.get('user') or {}).get('screen_name', ''),
+                    title='', content_html=content, images=images,
+                    url=f'https://m.weibo.cn/detail/{pid}', published_at=published,
+                    needs_fulltext=WeiboCrawler._is_long(mb) or WeiboCrawler._is_long(rt))
 
-        return {
-            "post_id": str(mb.get("id")),
-            "author_name": (mb.get("user") or {}).get("screen_name", ""),
-            "title": "",
-            "content_html": content,
-            "images": images,
-            "url": f"https://m.weibo.cn/detail/{bid}",
-            "published_at": published,
-        }
+    def _extend(self, client, mb):
+        if not self._is_long(mb):
+            return
+        if time.monotonic() < type(self)._cooldown_until:
+            raise RateLimitedError('微博全文请求冷却中，请五分钟后重试')
+        try:
+            data = self._check_resp(client.get('https://m.weibo.cn/statuses/extend',
+                                               params={'id': str(mb['id'])}))
+        except RateLimitedError:
+            with self._cooldown_lock:
+                type(self)._cooldown_until = time.monotonic() + 300
+            raise
+        text = (data.get('data') or {}).get('longTextContent')
+        if not text or needs_fulltext(text):
+            raise RuntimeError('暂未取得完整正文，可稍后重试')
+        mb['text'], mb['isLongText'] = text, False
 
-    def fetch_posts(self, user_id: str) -> list[dict]:
+    def fetch_article_by_id(self, post_id):
+        if not re.fullmatch(r'\d{1,30}', str(post_id)):
+            raise ValueError('微博 ID 无效')
+        if time.monotonic() < type(self)._cooldown_until:
+            raise RateLimitedError('微博全文请求冷却中，请稍后重试')
+        with self._client() as c:
+            data = self._check_resp(c.get('https://m.weibo.cn/statuses/show', params={'id': post_id}))
+            mb = data.get('data') or {}
+            if str(mb.get('id', '')) != str(post_id):
+                raise RuntimeError('微博不存在或当前账号无权访问')
+            self._extend(c, mb)
+            rt = mb.get('retweeted_status')
+            if rt:
+                self._extend(c, rt)
+            post = self._parse_mblog(mb)
+            if post['needs_fulltext']:
+                raise RuntimeError('暂未取得完整正文')
+            return post
+
+    def fetch_posts(self, user_id):
         with self._client() as c:
             cid, _, _ = self._get_container_id(c, user_id)
-            data = self._check_resp(c.get(API, params={
-                "type": "uid", "value": user_id, "containerid": cid, "page": 1,
-            }))
+            data = self._check_resp(c.get(API, params={'type': 'uid', 'value': user_id,
+                                                      'containerid': cid, 'page': 1}))
             posts = []
-            for card in (data.get("data") or {}).get("cards", []):
-                if card.get("card_type") == 9 and card.get("mblog"):
+            for card in (data.get('data') or {}).get('cards', []):
+                if card.get('card_type') == 9 and card.get('mblog'):
                     try:
-                        posts.append(self._parse_mblog(card["mblog"]))
-                    except Exception:
+                        posts.append(self._parse_mblog(card['mblog']))
+                    except (ValueError, TypeError):
                         continue
             return posts
