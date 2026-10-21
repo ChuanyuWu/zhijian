@@ -16,6 +16,17 @@ CREDENTIAL_KEYS = KEYS
 status = {}
 _subscribers = set()
 _wake = None
+schedule = {'phase': 'idle', 'interval_sec': 120, 'next_run_at': None,
+            'last_cycle_at': None, 'current_platform': ''}
+
+def get_schedule():
+    result = dict(schedule)
+    try:
+        result['interval_sec'] = max(30, int(load_config().get('poll_interval_sec', 120)))
+    except (ValueError, TypeError):
+        pass
+    result['server_time'] = time.time()
+    return result
 
 def subscribe():
     q = asyncio.Queue(maxsize=200)
@@ -93,6 +104,8 @@ def _run_one_user(platform, user, cfg):
     for p in posts:
         record = dict(p, platform=platform, author_id=user['user_id'],
                       post_uid=f"{platform}:{user['user_id']}:{p['post_id']}")
+        if platform != 'zsxq' and user.get('display_name'):
+            record['author_name'] = user['display_name']
         if insert_post(record):
             if platform == 'weibo' and record.get('needs_fulltext') and budget:
                 budget -= 1
@@ -116,6 +129,8 @@ async def monitor_loop():
                 interval = min(86400, max(30, int(cfg.get('poll_interval_sec', 120))))
             except (ValueError, TypeError):
                 interval = 120
+            schedule.update(phase='polling', interval_sec=interval, next_run_at=None,
+                            last_cycle_at=time.time(), current_platform='')
             for user in cfg.get('users', []):
                 if not isinstance(user, dict) or not user.get('enabled', True):
                     continue
@@ -131,6 +146,7 @@ async def monitor_loop():
                     st.update(state='disabled', message='尚未连接账号')
                     continue
                 try:
+                    schedule['current_platform'] = platform
                     # Re-read before each user so refreshed credentials take effect immediately.
                     posts = await asyncio.to_thread(_run_one_user, platform, user, load_config())
                     st.update(state='ok', message='', new_count=st['new_count'] + len(posts))
@@ -149,6 +165,7 @@ async def monitor_loop():
                 await asyncio.sleep(3)
         except Exception:
             interval = 30  # A malformed legacy config must not permanently kill polling.
+        schedule.update(phase='waiting', current_platform='', next_run_at=time.time() + interval)
         try:
             await asyncio.wait_for(_wake.wait(), interval)
         except asyncio.TimeoutError:

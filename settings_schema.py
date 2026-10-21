@@ -1,5 +1,6 @@
 """Validation for local settings, imported lists and resolve requests."""
 import re
+from urllib.parse import urlparse, parse_qs, unquote
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
 from content_safety import safe_url
 
@@ -9,13 +10,26 @@ def normalize_id(platform, value):
     value = str(value).strip()
     if platform not in PLATFORMS:
         raise ValueError('不支持的平台')
-    patterns = {'weibo': r'(?:m\.weibo\.cn/u/|weibo\.com/u/)(\d+)',
-                'taoguba': r'(?:taoguba\.com\.cn|tgb\.cn)/blog/(\d+)',
-                'zsxq': r'wx\.zsxq\.com/dweb2/index/group/(\d+)',
-                'weread': r'(MP_WXS_\w+)'}
-    m = re.search(patterns[platform], value)
-    if m:
-        value = next(x for x in m.groups() if x)
+    match = re.search(r'https?://[^\s<>"，]+', value)
+    if match:
+        parsed = urlparse(match[0].rstrip('。）》)'))
+        host = (parsed.hostname or '').lower()
+        allowed = {'weibo': ('weibo.com', 'weibo.cn'), 'taoguba': ('tgb.cn', 'taoguba.com.cn'),
+                   'zsxq': ('zsxq.com',), 'weread': ('weread.qq.com',)}[platform]
+        if parsed.username or parsed.password or not any(host == d or host.endswith('.'+d) for d in allowed):
+            raise ValueError('链接与所选平台不匹配')
+        path = unquote(parsed.path)
+        patterns = {'weibo': r'^/(?:u/|profile/)?(\d{1,30})/?$',
+                    'taoguba': r'/(?:user/)?blog/(\d{1,30})(?:/|$)',
+                    'zsxq': r'/group/(\d{1,30})(?:/|$)', 'weread': r'(MP_WXS_\w+)'}
+        m = re.search(patterns[platform], path)
+        if m:
+            value = m[1]
+        else:
+            query = parse_qs(parsed.query)
+            keys = {'weibo': ('uid',), 'taoguba': ('userID', 'userId', 'user_id'),
+                    'zsxq': ('group_id',), 'weread': ('bookId',)}[platform]
+            value = next((query[k][0] for k in keys if query.get(k)), '')
     valid = r'\d{1,30}' if platform in ('weibo', 'taoguba') else (
         r'\d{1,30}(?::\d{1,30})?' if platform == 'zsxq' else r'MP_WXS_\w{1,150}')
     if not re.fullmatch(valid, value):
@@ -27,6 +41,7 @@ class User(BaseModel):
     platform: str
     user_id: str
     nickname: str = Field(default='', max_length=200)
+    display_name: str = Field(default='', max_length=200)
     avatar: str = Field(default='', max_length=2000)
     enabled: StrictBool = True
 
@@ -76,3 +91,7 @@ class SettingsPatch(BaseModel):
 class ResolveRequest(BaseModel):
     platform: str
     user_id: str
+
+class DiscoverRequest(BaseModel):
+    platform: str
+    query: str = Field(default='', max_length=1000)

@@ -4,6 +4,8 @@ const CREDENTIAL_IDS = {weibo_cookie:'weiboCookie', taoguba_cookie:'taogubaCooki
 let currentPlatform='', currentKeyword='', currentAuthor='', loadedCount=0;
 let settingsCache={users:[]}, userProfiles={}, pendingNew=new Map(), posts=new Map();
 let loadVersion=0, feedAbort=null, drawerOpen=false, connections={};
+let settingsDirty=false, settingsTab='monitors', candidates=[], discoveryVersion=0, scheduleState=null, lastConnectionHTML='';
+const connectionBusy=new Set();
 const dirtySecrets=new Set();
 const $ = id => document.getElementById(id);
 function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -26,15 +28,30 @@ function fmtTime(iso) {
 function avatarPlaceholder(platform,ch,size) { return `<span class="avatar avatar-ph ${esc(platform)}" style="width:${size}px;height:${size}px">${esc(ch)}</span>`; }
 function avatarHtml(p,size) {
   const profile=userProfiles[`${p.platform}:${p.author_id||p.user_id}`]||{};
-  const name=p.author_name||profile.nickname||p.nickname||'?';
-  return profile.avatar ? `<img class="avatar" width="${size}" height="${size}" src="${pimg(profile.avatar)}" alt="${esc(name[0])}">` : avatarPlaceholder(p.platform,name[0],size);
+  const name=displayName(p)||'?';
+  const avatar=p.avatar||profile.avatar;
+  return avatar ? `<img class="avatar" width="${size}" height="${size}" src="${pimg(avatar)}" alt="${esc(name[0])}">` : avatarPlaceholder(p.platform,name[0],size);
 }
-document.addEventListener('error',e=>{if(e.target.matches?.('img.avatar')) e.target.replaceWith(document.createTextNode(e.target.alt||'?'));},true);
+document.addEventListener('error',e=>{if(e.target.matches?.('img.avatar')){const span=document.createElement('span');span.className='avatar avatar-ph';span.textContent=e.target.alt||'?';span.style.width=(e.target.width||34)+'px';span.style.height=(e.target.height||34)+'px';e.target.replaceWith(span);}},true);
 async function loadProfiles() {
   const cfg=await api('/api/settings'); userProfiles={};
-  for(const u of cfg.users||[]) userProfiles[`${u.platform}:${u.user_id}`]={nickname:u.nickname,avatar:u.avatar};
+  for(const u of cfg.users||[]) userProfiles[`${u.platform}:${u.user_id}`]={nickname:u.nickname,display_name:u.display_name,avatar:u.avatar};
   return cfg;
 }
+function displayName(p){
+  const prof=userProfiles[`${p.platform}:${p.author_id||p.user_id}`]||{};
+  if(p.platform==='zsxq'&&p.author_id)return p.author_name||p.nickname||prof.nickname||p.author_id;
+  return p.display_name||prof.display_name||p.nickname||prof.nickname||p.author_name||p.author_id||p.user_id||'';
+}
+function markSettingsDirty(){settingsDirty=true;$('settingsDirty').textContent='有未保存的更改';}
+function switchSettingsTab(tab){
+  settingsTab=tab;
+  document.querySelectorAll('[data-settings-panel]').forEach(p=>p.hidden=p.dataset.settingsPanel!==tab);
+  document.querySelectorAll('[data-settings-tab]').forEach(b=>{b.classList.toggle('active',b.dataset.settingsTab===tab);b.setAttribute('aria-selected',String(b.dataset.settingsTab===tab));});
+  $('settingsDirty').textContent=settingsDirty?'有未保存的更改':tab==='accounts'?'连接操作即时生效':'修改列表或偏好后保存';
+  if(tab==='accounts')refreshConnections().catch(showError);
+}
+document.querySelector('.settings-tabs').onclick=e=>{const b=e.target.closest('[data-settings-tab]');if(b)switchSettingsTab(b.dataset.settingsTab);};
 function tidyHtml(html) {
   const d=document.createElement('div'); d.innerHTML=html||'';
   // Defense in depth; the server applies the authoritative HTML whitelist.
@@ -54,7 +71,7 @@ function cardHtml(p, expanded=false) {
   const content=tidyHtml(p.content_html);
   return `<article class="card" data-id="${Number(p.id)}">
     <div class="card-head">${avatarHtml(p,34)}<span class="badge ${esc(p.platform)}">${esc(PLATFORM_NAMES[p.platform]||p.platform)}</span>
-    <span class="author" data-action="author" data-key="${esc(p.platform+':'+p.author_id)}">${esc(p.author_name||p.author_id)}</span>
+    <span class="author" data-action="author" data-key="${esc(p.platform+':'+p.author_id)}">${esc(displayName(p))}</span>
     <span class="time">${esc(fmtTime(p.published_at))}</span><button class="del-btn" data-action="delete" title="删除帖子">×</button></div>
     ${p.title?`<div class="card-title">${esc(p.title)}</div>`:''}
     <div class="collapsible ${collapse?'collapsed':''}"><div class="card-body">${content||'（正文暂未抓取，可查看原文）'}</div><div class="fade"></div></div>
@@ -96,7 +113,7 @@ $('feed').addEventListener('click',async e=>{
 function zoom(url){$('lightbox').querySelector('img').src=url;$('lightbox').style.display='flex';}
 $('lightbox').onclick=()=>$('lightbox').style.display='none';
 function clearPending(){pendingNew.clear();$('newTip').style.display='none';}
-function filterAuthor(key){currentAuthor=key;$('authorChip').style.display='inline-flex';$('authorChip').querySelector('span').textContent='正在看：'+(userProfiles[key]?.nickname||key.split(':')[1]);loadPosts().catch(showError);}
+function filterAuthor(key){currentAuthor=key;$('authorChip').style.display='inline-flex';$('authorChip').querySelector('span').textContent='正在看：'+(userProfiles[key]?.display_name||userProfiles[key]?.nickname||key.split(':')[1]);loadPosts().catch(showError);}
 function clearAuthor(){currentAuthor='';$('authorChip').style.display='none';loadPosts().catch(showError);}
 $('authorChip').onclick=clearAuthor;
 function showError(e){if(e.name!=='AbortError')toast(e.message,'#b91c1c');}
@@ -123,71 +140,127 @@ function connectStream(){
   // EventSource handles reconnection; no parallel manual reconnect loops.
 }
 $('newTip').onclick=()=>{loadPosts().catch(showError);window.scrollTo({top:0,behavior:'smooth'});};
-function notify(p){if('Notification'in window&&Notification.permission==='granted')new Notification(`${PLATFORM_NAMES[p.platform]} · ${p.author_name||''}`,{body:p.title||plainText(p.content_html).slice(0,80)});}
+function notify(p){if('Notification'in window&&Notification.permission==='granted')new Notification(`${PLATFORM_NAMES[p.platform]} · ${displayName(p)}`,{body:p.title||plainText(p.content_html).slice(0,80)});}
+function updateCountdown(){
+  const el=$('pollCountdown');if(!el||!scheduleState)return;
+  const st=scheduleState;
+  if(st.phase==='polling'){el.textContent='正在检查'+(PLATFORM_NAMES[st.current_platform]?' · '+PLATFORM_NAMES[st.current_platform]:'');return;}
+  if(st.next_run_at){const seconds=Math.max(0,Math.ceil(st.next_run_at-(Date.now()/1000+st.clockOffset)));el.textContent=seconds?'下轮 '+seconds+' 秒':'即将检查';}
+  else el.textContent='等待首次检查';
+}
 async function refreshStatus(){
-  const data=await api('/api/status'); let html=`📦 已存 ${data.total} 条`,alerts=[];
+  const data=await api('/api/status'); let html=`<span>📦 已存 ${data.total} 条</span>`,alerts=[];
   const labels={ok:'正常',disabled:'未启用',pending:'等待抓取',auth_error:'登录失效',rate_limited:'限流中',error:'异常',partial_error:'部分异常'};
   for(const [key,st]of Object.entries(data.status)){
     const color=st.state==='ok'?'':st.state==='disabled'||st.state==='pending'?'gray':st.state==='rate_limited'?'warn':'err';
-    html+=` <span class="st" title="${esc(st.message)}"><span class="dot ${color}"></span>${esc(PLATFORM_NAMES[key])}${esc(labels[st.state]||st.state)}</span>`;
+    html+=`<span class="st" title="${esc(st.message)}"><span class="dot ${color}"></span>${esc(PLATFORM_NAMES[key])}${esc(labels[st.state]||st.state)}${st.last_run?` <time>${esc(st.last_run)}</time>`:''}</span>`;
     for(const u of st.users||[])if(u.state==='auth_error')alerts.push(`${PLATFORM_NAMES[key]}：登录已失效，请重新连接`);
   }
-  $('statusBar').innerHTML=html;$('banner').textContent=[...new Set(alerts)].join('；');$('banner').classList.toggle('show',alerts.length>0);
-  if(drawerOpen){$('userStatus').innerHTML=Object.entries(data.status).flatMap(([k,s])=>(s.users||[]).map(u=>`<div>${esc(PLATFORM_NAMES[k])} · ${esc(u.nickname||u.user_id)}：${esc(labels[u.state]||u.state)} ${esc(u.message||'')}</div>`)).join('');}
+  if(data.scheduler){scheduleState={...data.scheduler,clockOffset:data.scheduler.server_time-Date.now()/1000};html+=`<span class="poll-status">轮次间隔 ${data.scheduler.interval_sec} 秒 · <span id="pollCountdown"></span></span>`;}
+  $('statusBar').innerHTML=html;updateCountdown();$('banner').textContent=[...new Set(alerts)].join('；');$('banner').classList.toggle('show',alerts.length>0);
+  if(drawerOpen){$('userStatus').innerHTML=Object.entries(data.status).flatMap(([k,s])=>(s.users||[]).map(u=>`<div class="user-status-row"><span>${esc(PLATFORM_NAMES[k])} · ${esc(u.nickname||u.user_id)}</span><span>${esc(labels[u.state]||u.state)} ${esc(u.last_run||'')}</span><small>${esc(u.message||'')}</small></div>`)).join('');}
 }
+setInterval(updateCountdown,1000);
 async function openSettings(){
-  drawerOpen=true;$('drawer').scrollTop=0;$('drawer').classList.add('open');$('drawerMask').classList.add('open');
+  if(drawerOpen)return;drawerOpen=true;settingsDirty=false;++discoveryVersion;$('discoverButton').disabled=false;document.querySelector('.manual-credentials').open=false;$('userSearch').value='';$('candidateResults').textContent='';$('addMonitor').open=false;$('drawer').scrollTop=0;$('drawer').classList.add('open');$('drawerMask').classList.add('open');
   try{
     const cfg=await loadProfiles();settingsCache=structuredClone(cfg);dirtySecrets.clear();
     for(const [key,id]of Object.entries(CREDENTIAL_IDS)){$(id).value='';$(id).placeholder=cfg[key]?'已保存；留空保持不变':'尚未配置';}
-    $('interval').value=cfg.poll_interval_sec;renderUserList(cfg.users||[]);await refreshConnections();await refreshStatus();
+    $('interval').value=cfg.poll_interval_sec;renderUserList(cfg.users||[]);switchSettingsTab(cfg.users?.length?'monitors':'accounts');updateDiscoveryMode();await refreshConnections();await refreshStatus();
   }catch(e){showError(e);}
 }
-function closeSettings(){drawerOpen=false;$('drawer').classList.remove('open');$('drawerMask').classList.remove('open');}
-for(const [key,id]of Object.entries(CREDENTIAL_IDS))$(id).addEventListener('input',()=>dirtySecrets.add(key));
-function renderUserList(users){$('userList').innerHTML=users.map((u,i)=>`<div class="user-row"><span class="badge ${esc(u.platform)}">${esc(PLATFORM_NAMES[u.platform])}</span><span class="grow">${esc(u.nickname||u.user_id)} <small>${esc(u.user_id)}</small></span><button data-toggle-user="${i}" class="btn ghost">${u.enabled===false?'启用':'暂停'}</button><button class="del" data-delete-user="${i}">×</button></div>`).join('')||'<div class="hint">连接平台后，在下方添加监控对象。</div>';}
-$('userList').onclick=e=>{const del=e.target.closest('[data-delete-user]'),toggle=e.target.closest('[data-toggle-user]');if(del)settingsCache.users.splice(Number(del.dataset.deleteUser),1);if(toggle){const u=settingsCache.users[Number(toggle.dataset.toggleUser)];u.enabled=u.enabled===false;}renderUserList(settingsCache.users);};
+function closeSettings(){if(settingsDirty&&!confirm('有未保存的列表或偏好修改，放弃这些修改并关闭？'))return;settingsDirty=false;drawerOpen=false;++discoveryVersion;$('discoverButton').disabled=false;$('drawer').classList.remove('open');$('drawerMask').classList.remove('open');}
+for(const [key,id]of Object.entries(CREDENTIAL_IDS))$(id).addEventListener('input',()=>{dirtySecrets.add(key);markSettingsDirty();});
+function renderUserList(users){
+  const filter=$('userSearch').value.trim().toLowerCase();$('userCount').textContent=users.length+' 个';
+  const visible=users.map((u,i)=>({u,i})).filter(({u})=>[u.display_name,u.nickname,u.user_id,PLATFORM_NAMES[u.platform]].some(x=>(x||'').toLowerCase().includes(filter)));
+  $('userList').innerHTML=visible.map(({u,i})=>`<div class="user-row ${u.enabled===false?'paused':''}">${avatarHtml(u,36)}<div class="user-info"><b title="${esc(u.user_id)}">${esc(u.display_name||u.nickname||u.user_id)}</b><small><span class="platform-dot ${esc(u.platform)}"></span>${esc(PLATFORM_NAMES[u.platform])}${u.enabled===false?' · 已暂停':''}</small></div><button data-toggle-user="${i}" class="text-btn">${u.enabled===false?'启用':'暂停'}</button><details class="user-more"><summary aria-label="管理对象">⋯</summary><div><button data-refresh-user="${i}">更新资料</button><button data-rename-user="${i}">编辑显示名称</button><button class="danger" data-delete-user="${i}">移除监控</button></div></details></div>`).join('')||`<div class="empty-list">${filter?'没有匹配的监控对象':'还没有监控对象，点击添加开始。'}</div>`;
+}
+$('userSearch').oninput=()=>renderUserList(settingsCache.users||[]);
+$('userList').onclick=async e=>{
+  const del=e.target.closest('[data-delete-user]'),toggle=e.target.closest('[data-toggle-user]'),rename=e.target.closest('[data-rename-user]'),refresh=e.target.closest('[data-refresh-user]');
+  if(del){const i=Number(del.dataset.deleteUser),u=settingsCache.users[i];if(!confirm('移除 '+(u.display_name||u.nickname||u.user_id)+' 的监控？已抓取帖子会保留。'))return;settingsCache.users.splice(i,1);}
+  if(toggle){const u=settingsCache.users[Number(toggle.dataset.toggleUser)];u.enabled=u.enabled===false;}
+  if(rename){const u=settingsCache.users[Number(rename.dataset.renameUser)];const value=prompt('设置显示名称（不修改平台账号）',u.display_name||u.nickname||'');if(value===null)return;if(!value.trim()||value.length>200)return toast('名称应为 1–200 个字符','#b91c1c');u.display_name=value.trim();}
+  if(refresh){const u=settingsCache.users[Number(refresh.dataset.refreshUser)];refresh.disabled=true;try{const d=await api('/api/users/resolve',{method:'POST',body:JSON.stringify({platform:u.platform,user_id:u.user_id})});const current=settingsCache.users.find(x=>x.platform===u.platform&&x.user_id===u.user_id);if(current){current.nickname=d.nickname;current.avatar=d.avatar;}toast('资料已更新，保存后生效');}catch(e){showError(e);return;}finally{refresh.disabled=false;}}
+  if(del||toggle||rename||refresh){markSettingsDirty();renderUserList(settingsCache.users);}
+};
+$('interval').oninput=markSettingsDirty;
+$('openAdd').onclick=()=>{$('addMonitor').open=true;updateDiscoveryMode();$('newUid').focus();};
+function updateDiscoveryMode(){
+  const p=$('newPlatform').value;
+  const hints={weibo:'输入昵称搜索，或直接粘贴微博主页链接。预览后选择正确的人。',taoguba:'直接粘贴博主主页链接，不用提取 UID。',zsxq:'从已加入的星球选择，或粘贴星球主页链接。',weread:'从微信读书书架选择公众号，无需查找 ID。'};
+  $('discoveryHint').textContent=hints[p];$('newUid').placeholder={weibo:'昵称或微博主页链接',taoguba:'粘贴淘股吧博主主页链接',zsxq:'星球名称或主页链接',weread:'搜索书架上的公众号'}[p];
+  $('browseTargets').hidden=!['zsxq','weread'].includes(p);$('browseTargets').textContent=p==='weread'?'读取微信读书书架':'读取已加入的星球';
+  $('openPlatform').href={weibo:'https://m.weibo.cn/',taoguba:'https://www.tgb.cn/',zsxq:'https://wx.zsxq.com/',weread:'https://weread.qq.com/web/shelf'}[p];
+}
+$('newPlatform').onchange=()=>{++discoveryVersion;$('discoverButton').disabled=false;candidates=[];$('candidateResults').textContent='';updateDiscoveryMode();};
+async function discoverTargets(list=false){
+  const query=list?'':$('newUid').value.trim(),platform=$('newPlatform').value;
+  if(!query&&!['zsxq','weread'].includes(platform))return toast('请输入昵称或主页链接','#b91c1c');
+  const version=++discoveryVersion;$('discoverButton').disabled=true;$('candidateResults').textContent='正在查找…';
+  try{const result=await api('/api/users/discover',{method:'POST',body:JSON.stringify({platform,query})});if(version!==discoveryVersion)return;$('newPlatform').value=result.platform;updateDiscoveryMode();candidates=result.candidates||[];renderCandidates();}
+  catch(e){if(version===discoveryVersion)$('candidateResults').textContent=e.message;}
+  finally{if(version===discoveryVersion)$('discoverButton').disabled=false;}
+}
+function renderCandidates(){
+  $('candidateResults').innerHTML=candidates.map((u,i)=>{const added=settingsCache.users.some(x=>x.platform===u.platform&&x.user_id===u.user_id);return `<div class="candidate-row">${avatarHtml(u,34)}<div class="user-info"><b>${esc(u.nickname||u.user_id)}</b><small>${esc(u.description||PLATFORM_NAMES[u.platform])}</small><small>ID ${esc(u.user_id)}</small></div><button class="btn small ghost" data-candidate="${i}" ${added?'disabled':''}>${added?'已添加':'添加'}</button></div>`;}).join('')||'<p class="hint">未找到对象。可换一个昵称，或直接粘贴主页链接。</p>';
+}
+$('candidateResults').onclick=e=>{const b=e.target.closest('[data-candidate]');if(!b)return;const u=candidates[Number(b.dataset.candidate)];if(settingsCache.users.some(x=>x.platform===u.platform&&x.user_id===u.user_id))return;settingsCache.users.push({platform:u.platform,user_id:u.user_id,nickname:u.nickname||'',avatar:u.avatar||'',enabled:true});markSettingsDirty();renderUserList(settingsCache.users);renderCandidates();toast('已加入，保存后开始监控');};
+$('discoverButton').onclick=()=>discoverTargets();$('browseTargets').onclick=()=>discoverTargets(true);$('newUid').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();discoverTargets();}};
 async function addUser(){
   const platform=$('newPlatform').value;let uid=$('newUid').value.trim(),nickname='',avatar='';if(!uid)return toast('请填写用户 ID 或主页链接','#b91c1c');
   try{const d=await api('/api/users/resolve',{method:'POST',body:JSON.stringify({platform,user_id:uid})});uid=d.user_id;nickname=d.nickname;avatar=d.avatar;}
   catch(e){if(!confirm(e.message+'。是否仍然添加？保存时会检查 ID 格式。'))return;}
   settingsCache.users??=[];if(settingsCache.users.some(u=>u.platform===platform&&u.user_id===uid))return toast('该对象已存在');
-  settingsCache.users.push({platform,user_id:uid,nickname,avatar,enabled:true});renderUserList(settingsCache.users);$('newUid').value='';toast('已加入列表，点击保存生效');
+  settingsCache.users.push({platform,user_id:uid,nickname,avatar,enabled:true});markSettingsDirty();renderUserList(settingsCache.users);$('newUid').value='';toast('已加入列表，点击保存生效');
 }
-async function syncShelf(){
-  $('shelfList').textContent='正在读取书架…';
-  try{const d=await api('/api/weread/shelf');$('shelfList').dataset.accs=JSON.stringify(d.accounts||[]);$('shelfList').innerHTML=(d.accounts||[]).map((a,i)=>`<div class="user-row"><span class="grow">${esc(a.nickname)}</span><button class="btn ghost" data-shelf="${i}">${settingsCache.users.some(u=>u.platform==='weread'&&u.user_id===a.user_id)?'已添加':'＋ 添加'}</button></div>`).join('')||'<div class="hint">书架没有公众号，请先在手机微信读书 App 订阅。</div>';}
-  catch(e){$('shelfList').textContent=e.message;}
-}
-function addShelfUser(i){const a=JSON.parse($('shelfList').dataset.accs||'[]')[i];if(a&&!settingsCache.users.some(u=>u.platform==='weread'&&u.user_id===a.user_id)){settingsCache.users.push({...a,platform:'weread',enabled:true});renderUserList(settingsCache.users);toast('已加入，点击保存生效');}}
-$('shelfList').onclick=e=>{const b=e.target.closest('[data-shelf]');if(b)addShelfUser(Number(b.dataset.shelf));};
-function exportUsers(){const users=(settingsCache.users||[]).map(({platform,user_id,nickname,avatar,enabled})=>({platform,user_id,nickname,avatar,enabled}));const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(users,null,2)],{type:'application/json'}));a.download='监控列表.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
+function syncShelf(){$('newPlatform').value='weread';updateDiscoveryMode();discoverTargets(true);}
+function exportUsers(){const users=(settingsCache.users||[]).map(({platform,user_id,nickname,display_name,avatar,enabled})=>({platform,user_id,nickname,display_name,avatar,enabled}));const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(users,null,2)],{type:'application/json'}));a.download='监控列表.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
 function importUsers(input){
   const file=input.files[0];input.value='';if(!file)return;if(file.size>512000)return toast('列表文件过大','#b91c1c');
-  file.text().then(text=>{const list=JSON.parse(text);if(!Array.isArray(list))throw new Error('格式错误');for(const u of list){if(!PLATFORM_NAMES[u.platform]||!u.user_id)throw new Error('包含无效平台或 ID');if(!settingsCache.users.some(x=>x.platform===u.platform&&x.user_id===String(u.user_id)))settingsCache.users.push({platform:u.platform,user_id:String(u.user_id),nickname:String(u.nickname||''),avatar:String(u.avatar||''),enabled:u.enabled!==false});}renderUserList(settingsCache.users);toast('已导入，点击保存生效');}).catch(()=>toast('导入失败，请检查列表格式','#b91c1c'));
+  file.text().then(text=>{
+    const list=JSON.parse(text);if(!Array.isArray(list)||list.length>500)throw new Error('格式错误');
+    const merged=structuredClone(settingsCache.users||[]);
+    for(const u of list){
+      if(!u||typeof u!=='object'||!PLATFORM_NAMES[u.platform]||!u.user_id)throw new Error('包含无效平台或 ID');
+      if(merged.some(x=>x.platform===u.platform&&x.user_id===String(u.user_id)))continue;
+      merged.push({platform:u.platform,user_id:String(u.user_id),nickname:String(u.nickname||''),display_name:String(u.display_name||''),avatar:String(u.avatar||''),enabled:u.enabled!==false});
+    }
+    if(merged.length>500)throw new Error('列表过大');
+    settingsCache.users=merged;markSettingsDirty();renderUserList(merged);toast('已导入，保存后生效');
+  }).catch(()=>toast('导入失败，请检查列表格式','#b91c1c'));
 }
 async function saveSettings(){
   const body={poll_interval_sec:Number($('interval').value),users:settingsCache.users||[]};
   for(const key of dirtySecrets)body[key]=$(CREDENTIAL_IDS[key]).value.trim();
-  try{await api('/api/settings',{method:'PUT',body:JSON.stringify(body)});dirtySecrets.clear();closeSettings();toast('已保存，监控即将使用新设置');await loadProfiles();await refreshStatus();}
+  try{await api('/api/settings',{method:'PUT',body:JSON.stringify(body)});dirtySecrets.clear();settingsDirty=false;closeSettings();toast('已保存，监控即将使用新设置');await loadProfiles();await loadPosts();await refreshStatus();}
   catch(e){showError(e);}
 }
-const CONNECTION_LABELS={unconfigured:'未连接',pending:'待验证',ok:'已连接',public:'公开内容免登录',auth_error:'需重新登录',network_error:'网络异常',rate_limited:'请求受限',error:'连接异常',starting:'正在启动',waiting:'等待登录',cancelled:'已取消',timeout:'登录超时'};
+const CONNECTION_LABELS={unconfigured:'未连接',pending:'凭据已保存',ok:'已连接',public:'免登录',auth_error:'需要重新登录',network_error:'网络异常',rate_limited:'稍后重试',error:'连接异常',starting:'正在打开窗口',waiting:'等待官方窗口确认',cancelled:'已取消',timeout:'登录超时'};
 async function refreshConnections(){connections=await api('/api/connections');renderConnections();}
 function renderConnections(){
-  $('connections').innerHTML=Object.entries(PLATFORM_NAMES).map(([key,name])=>{const st=connections[key]||{state:'unconfigured'},active=['starting','waiting'].includes(st.state);return `<section class="connection-card"><b>${esc(name)}</b><span class="connection-state">${esc(CONNECTION_LABELS[st.state]||st.state)}</span><div class="hint">${esc(st.message||'')}</div><div class="connection-actions"><button class="btn ghost" data-platform="${key}" data-connect-action="start" ${active?'disabled':''}>${st.state==='ok'?'重新登录':'连接账号'}</button><button class="btn ghost" data-platform="${key}" data-connect-action="validate" ${active?'disabled':''}>验证连接</button><button class="btn ghost" data-platform="${key}" data-connect-action="${active?'cancel':'disconnect'}">${active?'取消登录':'断开连接'}</button></div></section>`;}).join('');
+  const signature=JSON.stringify(connections)+[...connectionBusy].join();if(signature===lastConnectionHTML)return;lastConnectionHTML=signature;
+  const open=[...$('connections').querySelectorAll('details[open]')].map(d=>d.dataset.platform);
+  $('connections').innerHTML=Object.entries(PLATFORM_NAMES).map(([key,name])=>{
+    const st=connections[key]||{state:'unconfigured'},active=['starting','waiting'].includes(st.state),busy=connectionBusy.has(key);
+    let primary=['pending','network_error','rate_limited'].includes(st.state)?'validate':'start';
+    const label=active?'等待确认…':primary==='validate'?'验证连接':st.state==='auth_error'?'重新登录':'连接';
+    const message=st.state==='ok'?'登录会话可用':st.state==='public'?'公开帖子无需配置账号':st.state==='pending'?'已保存本地凭据，可验证是否可用':st.state==='unconfigured'?'点击连接，在官方窗口扫码登录':st.message||'';
+    return `<section class="connection-card state-${esc(st.state)}"><div class="connection-main"><span class="platform-icon ${key}">${name[0]}</span><div class="connection-info"><b>${name}</b><small>${esc(CONNECTION_LABELS[st.state]||st.state)}</small></div>${!['ok','public'].includes(st.state)?`<button class="btn small ${active?'ghost':''}" data-platform="${key}" data-connect-action="${primary}" ${active||busy?'disabled':''}>${busy?'处理中…':label}</button>`:''}${active?`<button class="text-btn" data-platform="${key}" data-connect-action="cancel">取消</button>`:`<details class="connection-more" data-platform="${key}" ${open.includes(key)?'open':''}><summary>管理</summary><div><button data-platform="${key}" data-connect-action="validate" ${busy?'disabled':''}>验证连接</button><button data-platform="${key}" data-connect-action="start" ${busy?'disabled':''}>${st.state==='public'?'可选登录':'重新登录'}</button><button class="danger" data-platform="${key}" data-connect-action="disconnect" ${busy?'disabled':''}>断开连接</button></div></details>`}</div><p class="connection-message">${esc(message)}</p></section>`;
+  }).join('');
 }
 $('connections').onclick=async e=>{
   const b=e.target.closest('[data-connect-action]');if(!b)return;
   const platform=b.dataset.platform,action=b.dataset.connectAction;
   if(action==='disconnect'&&!confirm(`断开${PLATFORM_NAMES[platform]}并清除本地登录会话？监控列表和帖子会保留。`))return;
-  b.disabled=true;
+  if(connectionBusy.has(platform))return;connectionBusy.add(platform);renderConnections();
   try{const path='/api/connections/'+platform+(action==='disconnect'?'':'/'+action);const result=await api(path,{method:action==='disconnect'?'DELETE':'POST',body:'{}'});connections[platform]=result;renderConnections();if(action==='disconnect'){const key={weibo:'weibo_cookie',taoguba:'taoguba_cookie',zsxq:'zsxq_token',weread:'weread_cookie'}[platform];$(CREDENTIAL_IDS[key]).value='';$(CREDENTIAL_IDS[key]).placeholder='尚未配置';dirtySecrets.delete(key);}toast(result.message);}
-  catch(e){showError(e);}finally{b.disabled=false;}
+  catch(e){showError(e);}finally{connectionBusy.delete(platform);renderConnections();}
 };
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));t.classList.add('active');currentPlatform=t.dataset.platform;loadPosts().catch(showError);});
 let searchTimer;$('searchBox').oninput=e=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{currentKeyword=e.target.value.trim();loadPosts().catch(showError);},350);};
 function applyTheme(t){document.documentElement.dataset.theme=t;localStorage.setItem('pm-theme',t);$('themeSelect').value=t;}
 $('themeSelect').onchange=e=>applyTheme(e.target.value);applyTheme(localStorage.getItem('pm-theme')||'dark');
 $('notifyButton').onclick=async()=>{if('Notification'in window)toast('通知权限：'+await Notification.requestPermission());};
-(async()=>{try{await loadProfiles();await loadPosts();await refreshStatus();connectStream();}catch(e){showError(e);}setInterval(()=>refreshStatus().catch(()=>{}),30000);setInterval(()=>{if(drawerOpen)refreshConnections().catch(()=>{});},2000);})();
+(async()=>{try{await loadProfiles();await loadPosts();await refreshStatus();connectStream();}catch(e){showError(e);}setInterval(()=>refreshStatus().catch(()=>{}),5000);setInterval(()=>{if(drawerOpen)refreshConnections().catch(()=>{});},2000);})();

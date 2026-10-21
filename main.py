@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 from fastapi.staticfiles import StaticFiles
 from config import BASE_DIR, DATA_DIR, SECRET_KEYS, load_config, mutate_config
 from database import count_posts, delete_post, get_post, init_db, query_posts
-from settings_schema import SettingsPatch, ResolveRequest, normalize_id
+from settings_schema import SettingsPatch, ResolveRequest, DiscoverRequest, normalize_id
 from connections import KEYS
 from login_manager import manager
 from crawlers.base import AuthExpiredError, RateLimitedError
@@ -174,7 +174,8 @@ async def stream():
 
 @app.get('/api/status')
 def status():
-    return {'status': monitor.get_status(), 'total': count_posts()}
+    return {'status': monitor.get_status(), 'total': count_posts(),
+            'scheduler': monitor.get_schedule()}
 
 @app.get('/api/settings')
 def settings():
@@ -206,6 +207,21 @@ def valid_platform(platform):
     if platform not in KEYS:
         raise HTTPException(404, '不支持的平台')
     return platform
+
+@app.post('/api/users/discover')
+async def discover_users(body: DiscoverRequest):
+    from discovery import discover
+    platform = valid_platform(body.platform)
+    try:
+        return await asyncio.to_thread(discover, platform, body.query)
+    except AuthExpiredError:
+        raise HTTPException(400, '请先在平台账号页连接该平台')
+    except RateLimitedError:
+        raise HTTPException(429, '平台暂时限制查询，请稍后再试')
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except Exception:
+        raise HTTPException(502, '暂时未能查到对象，请检查平台连接，或改用主页链接')
 
 @app.get('/api/connections')
 async def connection_status():
